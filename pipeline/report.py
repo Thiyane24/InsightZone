@@ -27,16 +27,19 @@ UTIL_W = PAGE_W - (2 * MARGIN)
 def _styles():
     """Centraliza a tipografia e os estilos de parágrafo reutilizados no documento."""
     return {
+        # ENTENDIMENTO: Adicionado leading proporcional (22) para fontSize (18). 
+        # Isto impede que o texto herde um espaçamento menor e sobreponha as linhas seguintes.
         'biz_name': ParagraphStyle(
-            'biz_name', fontName='Helvetica-Bold', fontSize=18,
-            textColor=PRIMARY, alignment=TA_LEFT, spaceAfter=2
+            'biz_name', fontName='Helvetica-Bold', fontSize=18, leading=22,
+            textColor=PRIMARY, alignment=TA_LEFT, spaceAfter=4
         ),
+        # ENTENDIMENTO: Adicionado leading (12) para fontSize (9) para dar respiro vertical às metadados.
         'meta_sub': ParagraphStyle(
-            'meta_sub', fontName='Helvetica', fontSize=9,
-            textColor=MID_GREY, alignment=TA_LEFT, spaceAfter=1
+            'meta_sub', fontName='Helvetica', fontSize=9, leading=12,
+            textColor=MID_GREY, alignment=TA_LEFT, spaceAfter=2
         ),
         'section_title': ParagraphStyle(
-            'section_title', fontName='Helvetica-Bold', fontSize=12,
+            'section_title', fontName='Helvetica-Bold', fontSize=12, leading=15,
             textColor=PRIMARY, spaceAfter=6, spaceBefore=12,
             keepWithNext=True  # CORREÇÃO: Junta o título à tabela subsequente prevenindo órfãos
         ),
@@ -85,7 +88,6 @@ def _kpi_block(metricas: dict, is_mensal: bool):
     value_cells  = [Paragraph(val, styles['kpi_val']) for _, val in kpis]
 
     col_w = UTIL_W / 4
-    # CORREÇÃO: Eliminado 'rowHeights' estático para permitir cálculo elástico do motor
     t = Table([header_cells, value_cells], colWidths=[col_w] * 4)
     t.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, -1), LIGHT_GREY),
@@ -125,7 +127,6 @@ def _performance_table(metricas: dict, is_mensal: bool):
     if len(rows) == 1:
         rows.append([Paragraph('—', styles['table_cell_c']), Paragraph('Nenhum dado encontrado', styles['table_cell']), Paragraph('0', styles['table_cell_c']), Paragraph('0.0%', styles['table_cell_c'])])
 
-    # CORREÇÃO: Proporções exatas de colunas que totalizam 1.0 (100% de UTIL_W)
     t = Table(rows, colWidths=[UTIL_W * 0.12, UTIL_W * 0.48, UTIL_W * 0.18, UTIL_W * 0.22])
     t.setStyle(TableStyle([
         ('BACKGROUND',    (0, 0), (-1, 0),  PRIMARY),
@@ -171,11 +172,6 @@ def _actionable_insights(metricas: dict, is_mensal: bool):
     return t
 
 def gerar_relatorio(metricas: dict, nome_negocio: str = "O meu negocio", output_dir: str = 'data/gold', semana_label: str = None) -> str:
-    """
-    CORREÇÃO COMPATIBILIDADE SÉNIOR:
-    Para respeitar a assinatura original do MVP sem quebras, se o 'semana_label' 
-    contiver a string estruturada de transação única (gerada no app.py), usamos esse nome diretamente.
-    """
     os.makedirs(output_dir, exist_ok=True)
     is_mensal = (metricas.get('total') == metricas.get('total_mensal'))
     
@@ -195,7 +191,9 @@ def gerar_relatorio(metricas: dict, nome_negocio: str = "O meu negocio", output_
     story.append(Paragraph(nome_negocio.upper(), styles['biz_name']))
     story.append(Paragraph(f"Relatório de Direção e Análise Estratégica  |  {periodo_visual}", styles['meta_sub']))
     story.append(Paragraph(f"Emitido em: {datetime.now().strftime('%d/%m/%Y %H:%M')} por InsightZone Core Engine", styles['meta_sub']))
-    story.append(Spacer(1, 5 * mm))
+    
+    # ENTENDIMENTO: Aumentado o espaçador pós-metadados para criar uma barreira protetora contra a tabela/divisória
+    story.append(Spacer(1, 8 * mm))
 
     # Divisória
     divider = Table([['']], colWidths=[UTIL_W], rowHeights=[1.5])

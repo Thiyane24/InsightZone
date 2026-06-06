@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+tests/
+data/gold_test/
+data/uploads_test/
+*.pdf
+*.json.bak
+.git/
+.env

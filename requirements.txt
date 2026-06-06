@@ -1,0 +1,23 @@
+# ── CORE ENGINE (FASTAPI & RUNTIME) ──────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.2
+python-multipart==0.0.9
+
+# ── DATA SCIENCE & PIPELINE ANALÍTICO ────────────────────────────────────────
+pandas==2.2.2
+numpy==1.26.4
+openpyxl==3.1.4
+pdfplumber==0.11.0
+Pillow==10.3.0
+
+# ── MOTOR DE RENDERIZAÇÃO DE PDF ─────────────────────────────────────────────
+reportlab==4.2.0
+
+# ── INTEGRAÇÃO E CLIENTE HTTP (META CLOUD API) ───────────────────────────────
+httpx==0.27.0
+python-dotenv==1.0.1
+
+# ── SUITE DE TESTES E QUALIDADE (OPCIONAL NO RUNTIME, MAS RETIDO PARA CI/CD) ──
+pytest==8.3.4
+pytest-asyncio==0.23.7
