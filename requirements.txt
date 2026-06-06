@@ -10,7 +10,8 @@ numpy==1.26.4
 openpyxl==3.1.4
 pdfplumber==0.11.0
 Pillow==10.3.0
-pyarrow==11.0.0
+pyarrow==16.1.0
+fastparquet==2024.5.0
 
 # ── MOTOR DE RENDERIZAÇÃO DE PDF ─────────────────────────────────────────────
 reportlab==4.2.0
