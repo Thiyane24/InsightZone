@@ -298,6 +298,11 @@ app = FastAPI()
 app.mount("/reports", StaticFiles(directory="data/gold"), name="reports")
 
 
+@app.get("/")
+def read_root():
+    return {"status": "healthy", "service": "InsightZone"}
+
+
 @app.get("/webhook")
 def verificar_webhook(
     hub_mode: str = Query(alias="hub.mode"),
