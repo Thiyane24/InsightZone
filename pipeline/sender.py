@@ -2,16 +2,16 @@ import httpx
 import os
 
 def enviar_mensagem(phone_number: str, texto: str):
-    """Envia uma mensagem de texto simples pelo WhatsApp Cloud API."""
+    """Envia uma mensagem de texto simples pelo WhatsApp Cloud API v25.0."""
     token = os.getenv("META_ACCESS_TOKEN")
-    
     phone_id = os.getenv("META_PHONE_NUMBER_ID") 
     
     if not token or not phone_id:
         print("Erro: META_ACCESS_TOKEN ou META_PHONE_NUMBER_ID em falta no .env")
         return
         
-    url = f"https://graph.facebook.com/v15.0/{phone_id}/messages"
+    # CORREÇÃO: Atualizado para v25.0 correspondente ao teu painel Meta developers
+    url = f"https://graph.facebook.com/v25.0/{phone_id}/messages"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
@@ -33,16 +33,21 @@ def enviar_mensagem(phone_number: str, texto: str):
 
 
 def main_function(phone_number: str, pdf_url: str, filename: str, mensagem: str = None):
-    """Envia o ficheiro PDF corretamente para a API da Meta usando URL público."""
+    """Envia o ficheiro PDF de forma determinística para a API da Meta v25.0."""
     token = os.getenv("META_ACCESS_TOKEN")
-    
     phone_id = os.getenv("META_PHONE_NUMBER_ID")
     
     if not token or not phone_id:
         print("Erro: META_ACCESS_TOKEN ou META_PHONE_NUMBER_ID em falta no .env")
         return
 
-    url = f"https://graph.facebook.com/v15.0/{phone_id}/messages"
+    # Se passaste uma mensagem contextual, enviamo-la primeiro como texto isolado
+    # para evitar que a Meta rejeite o payload binário do documento
+    if mensagem:
+        enviar_mensagem(phone_number, mensagem)
+
+    # CORREÇÃO: Atualizado para v25.0 correspondente ao teu painel Meta developers
+    url = f"https://graph.facebook.com/v25.0/{phone_id}/messages"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
@@ -58,9 +63,6 @@ def main_function(phone_number: str, pdf_url: str, filename: str, mensagem: str 
             "filename": filename
         }
     }
-
-    if mensagem:
-        payload["document"]["caption"] = mensagem
 
     try:
         print(f"A enviar PDF para o WhatsApp: {pdf_url}")
