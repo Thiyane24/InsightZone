@@ -1,0 +1,28 @@
+data,produto,quantidade,valor
+2026-06-01,Frango Grelhado,15,225.00
+2026-06-01,Arroz Branco,30,90.00
+2026-06-01,Sumo de Laranja,20,60.00
+2026-06-02,Frango Grelhado,18,270.00
+2026-06-02,Peixe Frito,10,150.00
+2026-06-02,Arroz Branco,25,75.00
+2026-06-02,Cerveja,40,120.00
+2026-06-03,Frango Grelhado,22,330.00
+2026-06-03,Sumo de Laranja,15,45.00
+2026-06-03,Peixe Frito,8,120.00
+2026-06-03,Arroz Branco,35,105.00
+2026-06-04,Cerveja,55,165.00
+2026-06-04,Frango Grelhado,20,300.00
+2026-06-04,Peixe Frito,12,180.00
+2026-06-04,Sumo de Laranja,18,54.00
+2026-06-05,Frango Grelhado,25,375.00
+2026-06-05,Arroz Branco,40,120.00
+2026-06-05,Cerveja,60,180.00
+2026-06-05,Peixe Frito,15,225.00
+2026-06-06,Frango Grelhado,30,450.00
+2026-06-06,Sumo de Laranja,22,66.00
+2026-06-06,Arroz Branco,45,135.00
+2026-06-06,Cerveja,50,150.00
+2026-06-07,Frango Grelhado,28,420.00
+2026-06-07,Peixe Frito,18,270.00
+2026-06-07,Arroz Branco,38,114.00
+2026-06-07,Sumo de Laranja,25,75.00
