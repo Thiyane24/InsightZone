@@ -20,7 +20,7 @@ load_dotenv()
 MENU = """Ola! Sou o InsightZone.
 Modo atual: {frequencia}
 
-1. Enviar ficheiro de vendas em formato CSV, Excel ou PDF para receber o relatorio.
+1. Enviar ficheiro de vendas in formato CSV, Excel ou PDF para receber o relatorio.
 2. Ver relatorio anterior
 3. Resumo rapido
 4. Top 5 produtos"""
@@ -122,7 +122,7 @@ def gerar_relatorio_background(phone_number: str, filepath: str, nome_cliente: s
         df = ingest(filepath)
         metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
         
-        # CORREÇÃO: Identificador único estrito usando Timestamp formatado e UUID truncado
+        # Identificador único estrito usando Timestamp formatado e UUID truncado
         timestamp_label = datetime.now().strftime('%Y%m%d_%H%M%S')
         hash_unico = uuid.uuid4().hex[:6]
         pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
@@ -148,16 +148,20 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
     try:
         token = os.getenv("META_ACCESS_TOKEN")
 
-        # Etapa A: Solicita o URL temporário de download à Graph API da Meta
-        meta_url = f"https://graph.facebook.com/v15.0/{document_id}"
+        # CORREÇÃO: Atualizado de v15.0 para v25.0 para corresponder ao teu painel Meta
+        meta_url = f"https://graph.facebook.com/v25.0/{document_id}"
         r = httpx.get(meta_url, headers={"Authorization": f"Bearer {token}"})
-        download_url = r.json()["url"]
+        download_url = r.json().get("url")
+
+        if not download_url:
+            print(f"Erro: Não foi possível obter a URL de download da Meta. Resposta: {r.text}")
+            return
 
         # Etapa B: Descarrega os bytes binários do ficheiro
         ficheiro = httpx.get(download_url, headers={"Authorization": f"Bearer {token}"})
         os.makedirs("data/uploads", exist_ok=True)
         
-        # CORREÇÃO: Força o isolamento físico do upload injetando um carimbo temporal no nome do arquivo
+        # Força o isolamento físico do upload injetando um carimbo temporal no nome do arquivo
         timestamp_upload = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         filename_seguro = f"{timestamp_upload}_{filename.replace(' ', '_')}"
         filepath = f"data/uploads/{filename_seguro}"
@@ -173,7 +177,7 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
         metricas = calcular_metricas(df, frequencia_cliente=frequencia)
         nome_empresa = cliente["nome"] if cliente and cliente.get("nome") else "O meu negocio"
         
-        # CORREÇÃO: Formatação exata do nome do relatório de saída (report_YYYYMMDD_HHMMSS_uuid.pdf)
+        # Formatação exata do nome do relatório de saída (report_YYYYMMDD_HHMMSS_uuid.pdf)
         timestamp_label = datetime.now().strftime('%Y%m%d_%H%M%S')
         hash_unico = uuid.uuid4().hex[:6]
         pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
@@ -195,6 +199,7 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
                 c["ultimo_ficheiro"] = filepath
                 break
         guardar_clientes(clientes)
+        print("Pipeline executado com sucesso através de upload de ficheiro!")
     except Exception as e:
         print(f"Erro ao processar ficheiro em background: {e}")
 
@@ -311,7 +316,8 @@ def verificar_webhook(
 ):
     """Rota de validação obrigatória exigida pela Meta para ativar o Webhook."""
     if hub_mode == "subscribe" and hub_verify_token == os.getenv("WEBHOOK_VERIFY_TOKEN"):
-        return int(hub_challenge)
+        # ATENÇÃO: Retorna o challenge diretamente como int/Response para evitar parsing com aspas adicionais
+        return Response(content=str(hub_challenge), media_type="text/plain")
     raise HTTPException(status_code=403, detail="Token inválido")
 
 
@@ -331,7 +337,7 @@ def receber_webhook(payload: dict, background_tasks: BackgroundTasks):
             
         mensagem = value["messages"][0]
         phone_number = mensagem.get("from")
-        tipo = message_type = mensagem.get("type")
+        tipo = mensagem.get("type")  # CORREÇÃO: Variável unificada e limpa para evitar colisões
         
     except (KeyError, IndexError, TypeError):
         return Response(content="OK", status_code=200)
@@ -346,9 +352,12 @@ def receber_webhook(payload: dict, background_tasks: BackgroundTasks):
             tratar_comando(phone_number, "novo", background_tasks)
             return Response(content="OK", status_code=200)
             
-        document_id = mensagem.get("document", {}).get("id")
-        filename = mensagem.get("document", {}).get("filename", f"vendas_{int(datetime.now().timestamp())}.csv")
+        # CORREÇÃO: Captura segura do nó document
+        doc_data = mensagem.get("document", {})
+        document_id = doc_data.get("id")
+        filename = doc_data.get("filename", f"vendas_{int(datetime.now().timestamp())}.xlsx")
         
-        background_tasks.add_task(processar_ficheiro, phone_number, document_id, filename)
+        if document_id:
+            background_tasks.add_task(processar_ficheiro, phone_number, document_id, filename)
 
     return Response(content="OK", status_code=200)
