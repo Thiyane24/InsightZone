@@ -1,23 +1,43 @@
-import pandas as pd 
+import pandas as pd
 import pdfplumber
+import os
 
-def ler_ficheiro(caminho):
-    if caminho.endswith('.csv'):
-        return pd.read_csv(caminho)
-    elif caminho.endswith('.xlsx', '.xls'):
-        return pd.read_excel(caminho)
-    elif caminho.endswith('.pdf'):
-        return ler_pdf(caminho)
-    return None
+def ingest(filepath: str) -> pd.DataFrame:
+    """Extracts a file and converts it into a pandas DataFrame."""
+    extension = os.path.splitext(filepath)[1].lstrip(".").lower()
 
-def ler_pdf(caminho):
-    with pdfplumber.open(caminho) as pdf:
-        texto = pdf.pages[0].extract_text()
-        if not texto or len(texto)<50:
-            return None
-        tabelas = []
-        for pagina in paginas:
-            tabelas.extend(pagina.extract_tables())
-    if not tabelas:
-        return None
-    return pd.DataFrame(tabelas[0][1:], columns=tabelas[0][0])
+    if extension == 'csv':
+        df = pd.read_csv(filepath)
+    elif extension in ['xlsx', 'xls']:
+        df = pd.read_excel(filepath)
+    elif extension == 'pdf':
+        df = read_pdf(filepath)
+    else:
+        raise ValueError(f'Formato nao suportado: {extension}')
+
+    # Salva os dados brutos extraidos
+    os.makedirs('data/bronze', exist_ok=True)
+    filename = os.path.splitext(os.path.basename(filepath))[0]  
+    dest = f'data/bronze/{filename}.parquet'                     
+    df.to_parquet(dest, index=False)
+    print(f'Bronze: {len(df)} linhas extraidas de {filepath} → {dest}')
+    return df
+
+
+def read_pdf(filepath: str) -> pd.DataFrame:
+    """Extrai tabelas de um PDF com texto seleccionavel."""
+    frames = []
+
+    with pdfplumber.open(filepath) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                if not table:
+                    continue
+                headers = table[0]
+                data = table[1:]
+                frames.append(pd.DataFrame(data, columns=headers))  
+
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+
+    return pd.DataFrame()
