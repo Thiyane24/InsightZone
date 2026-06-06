@@ -1,8 +1,8 @@
 import pandas as pd
 import os
 
-def calcular_metricas(df: pd.DataFrame) -> dict:
-   
+def calcular_metricas(df: pd.DataFrame, df_anterior: pd.DataFrame = None) -> dict:
+
     required = {'data', 'valor', 'produto', 'quantidade'}
     missing = required - set(df.columns)
     if missing:
@@ -10,10 +10,11 @@ def calcular_metricas(df: pd.DataFrame) -> dict:
     if df.empty:
         raise ValueError('DataFrame vazio nenhuma linha para processar')
 
-    vendas_por_data = df.groupby('data')['valor'].sum()  # computed once, reused 3x
+    vendas_por_data = df.groupby('data')['valor'].sum()
+    total = df['valor'].sum()
 
     metricas = {
-        'total': df['valor'].sum(),
+        'total': total,
         'total_transacoes': len(df),
         'media': df['valor'].mean(),
         'melhor_dia': vendas_por_data.idxmax(),
@@ -22,8 +23,14 @@ def calcular_metricas(df: pd.DataFrame) -> dict:
         'vendas_por_dia': vendas_por_data
     }
 
+    # Variação vs semana anterior, só se df_anterior for fornecido
+    if df_anterior is not None and not df_anterior.empty:
+        total_anterior = df_anterior['valor'].sum()
+        metricas['variacao_pct'] = ((total - total_anterior) / total_anterior) * 100
+
     # Salva silver layer
     os.makedirs('data/silver', exist_ok=True)
-    df.to_parquet('data/silver/processed.parquet', index=False)
+    semana = str(df['data'].max()).replace('/', '-')     
+    df.to_parquet(f'data/silver/{semana}.parquet', index=False)
 
     return metricas
