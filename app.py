@@ -4,7 +4,7 @@ import os
 import httpx
 from datetime import datetime, date
 import time
-import uuid  # INCLUSÃO: Para garantir unicidade matemática e imutabilidade dos relatórios
+import uuid  # Para garantir unicidade matemática e imutabilidade dos relatórios
 from dotenv import load_dotenv
 import json
 import urllib.parse
@@ -13,10 +13,10 @@ from pipeline.metrics import calcular_metricas
 from pipeline.report import gerar_relatorio
 from pipeline.sender import main_function, enviar_mensagem
 
-# Carrega as variáveis de ambiente declaradas no ficheiro .env (ex: tokens, URLs base)
+# Carrega as variáveis de ambiente declaradas no ficheiro .env
 load_dotenv()
 
-# Definição de templates de texto estáticos para interação com o utilizador no WhatsApp
+# Definição de templates de texto estáticos para interação com o utilizador
 MENU = """Ola! Sou o InsightZone.
 Modo atual: {frequencia}
 
@@ -32,7 +32,13 @@ AJUDA = """Comandos disponiveis:
 - 'top' ou '4' — top 5 produtos"""
 
 
-# ── JSON HELPERS (PERSISTÊNCIA LOCAL DE CLIENTES) ─────────────────────────────
+# ── JSON HELPERS (PERSISTÊNCIA LOCAL DE CLIENTES COM HIGIENIZAÇÃO) ───────────
+
+def limpar_numero(phone_number: str) -> str:
+    """Garante que o número contém apenas dígitos, eliminando o símbolo '+' ou espaços."""
+    if not phone_number:
+        return ""
+    return str(phone_number).replace("+", "").strip()
 
 def carregar_todos_clientes() -> list:
     """Carrega a base de dados local em JSON. Se não existir, cria um ficheiro vazio."""
@@ -51,9 +57,10 @@ def guardar_clientes(clientes: list):
         json.dump(clientes, f, ensure_ascii=False, indent=2)
 
 def carregar_cliente(phone_number: str) -> dict | None:
-    """Procura e retorna o perfil de um cliente específico com base no número de telefone."""
+    """Procura e retorna o perfil de um cliente específico com base no número higienizado."""
+    numero_limpo = limpar_numero(phone_number)
     for cliente in carregar_todos_clientes():
-        if cliente["numero"] == phone_number:
+        if limpar_numero(cliente.get("numero")) == numero_limpo:
             return cliente
     return None
 
@@ -67,47 +74,48 @@ def tratar_onboarding(phone_number: str, texto: str, cliente: dict):
     """
     clientes = carregar_todos_clientes()
     passo = cliente["onboarding_passo"]
+    numero_limpo = limpar_numero(phone_number)
 
     if passo == 1:
         for c in clientes:
-            if c["numero"] == phone_number:
+            if limpar_numero(c.get("numero")) == numero_limpo:
                 c["nome"] = texto
                 c["onboarding_passo"] = 2
                 break
         guardar_clientes(clientes)
-        enviar_mensagem(phone_number, "Que tipo de negocio tens?\n1. Servicos\n2. Retalho\n3. Agropecuaria\n4. Outro")
+        enviar_mensagem(numero_limpo, "Que tipo de negocio tens?\n1. Servicos\n2. Retalho\n3. Agropecuaria\n4. Outro")
 
     elif passo == 2:
         tipos = {"1": "servicos", "2": "retalho", "3": "agropecuaria", "4": "outro"}
         negocio = tipos.get(texto.strip(), texto.strip())
         for c in clientes:
-            if c["numero"] == phone_number:
+            if limpar_numero(c.get("numero")) == numero_limpo:
                 c["negocio"] = negocio
                 c["onboarding_passo"] = 3
                 break
         guardar_clientes(clientes)
-        enviar_mensagem(phone_number, "Qual e o teu email para relatorios de backup? (envia 'skip' para ignorar)")
+        enviar_mensagem(numero_limpo, "Qual e o teu email para relatorios de backup? (envia 'skip' para ignorar)")
 
     elif passo == 3:
         email = None if texto.strip().lower() == "skip" else texto.strip()
         for c in clientes:
-            if c["numero"] == phone_number:
+            if limpar_numero(c.get("numero")) == numero_limpo:
                 c["email"] = email
                 c["onboarding_passo"] = 4
                 break
         guardar_clientes(clientes)
-        enviar_mensagem(phone_number, "Como preferes enviar os teus dados e receber os relatorios?\n1. Semanalmente\n2. Mensalmente")
+        enviar_mensagem(numero_limpo, "Como preferes enviar os teus dados e receber os relatorios?\n1. Semanalmente\n2. Mensalmente")
 
     elif passo == 4:
         freq_map = {"1": "semanal", "2": "mensal"}
         frequencia = freq_map.get(texto.strip(), "semanal")
         for c in clientes:
-            if c["numero"] == phone_number:
+            if limpar_numero(c.get("numero")) == numero_limpo:
                 c["frequencia"] = frequencia
                 c["onboarding_passo"] = 0
                 break
         guardar_clientes(clientes)
-        enviar_mensagem(phone_number, f"Perfeito! Onboarding completo. Configurado para envio {frequencia}.\nEnvia agora o teu ficheiro CSV, Excel ou PDF com os teus dados de vendas.")
+        enviar_mensagem(numero_limpo, f"Perfeito! Onboarding completo. Configurado para envio {frequencia}.\nEnvia agora o teu ficheiro CSV, Excel ou PDF com os teus dados de vendas.")
 
 
 # ── TAREFAS ASSÍNCRONAS EM SEGUNDO PLANO (BACKGROUND TASKS) ────────────────────
@@ -115,40 +123,37 @@ def tratar_onboarding(phone_number: str, texto: str, cliente: dict):
 def gerar_relatorio_background(phone_number: str, filepath: str, nome_cliente: str, frequencia_atual: str):
     """
     Executa o pipeline pesado de dados fora do fluxo principal da rota HTTP.
-    Garante regeneração total contornando qualquer cache local ou na API do WhatsApp.
     """
     try:
-        # Ingestão e cálculo das métricas avançadas (dados são sempre relidos do arquivo transiente)
+        numero_limpo = limpar_numero(phone_number)
         df = ingest(filepath)
         metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
         
-        # Identificador único estrito usando Timestamp formatado e UUID truncado
         timestamp_label = datetime.now().strftime('%Y%m%d_%H%M%S')
         hash_unico = uuid.uuid4().hex[:6]
         pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
         
-        # O nome seguro e imutável é passado no contrato 'semana_label' para gravação direta no disco
         pdf_path = gerar_relatorio(metricas, nome_negocio=nome_cliente, semana_label=pdf_filename_limpo)
         
-        # Constrói o URL público codificado e dispara o envio do PDF limpo
         base_url = os.getenv("BASE_URL")
         pdf_url = f"{base_url}/reports/{urllib.parse.quote(pdf_filename_limpo)}"
         
         msg_envio = f"Aqui tens o teu relatório {frequencia_atual} atualizado:"
-        main_function(phone_number, pdf_url, pdf_filename_limpo, mensagem=msg_envio)
+        main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=msg_envio)
     except Exception as e:
         print(f"Erro ao processar relatório por texto em background: {e}")
 
 
 def processar_ficheiro(phone_number: str, document_id: str, filename: str):
     """
-    Descarrega o documento enviado pelo utilizador, isola o arquivo em disco utilizando
-    um identificador temporal único, processa e devolve o novo PDF de forma determinística.
+    Descarrega o documento da API Graph da Meta v25.0, roda o pipeline analítico
+    e envia o PDF estratégico de volta ao utilizador de forma síncrona/segura.
     """
     try:
         token = os.getenv("META_ACCESS_TOKEN")
+        numero_limpo = limpar_numero(phone_number)
 
-        # CORREÇÃO: Atualizado de v15.0 para v25.0 para corresponder ao teu painel Meta
+        # Atualizado para v25.0 correspondente ao teu painel Meta developers
         meta_url = f"https://graph.facebook.com/v25.0/{document_id}"
         r = httpx.get(meta_url, headers={"Authorization": f"Bearer {token}"})
         download_url = r.json().get("url")
@@ -157,11 +162,9 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
             print(f"Erro: Não foi possível obter a URL de download da Meta. Resposta: {r.text}")
             return
 
-        # Etapa B: Descarrega os bytes binários do ficheiro
         ficheiro = httpx.get(download_url, headers={"Authorization": f"Bearer {token}"})
         os.makedirs("data/uploads", exist_ok=True)
         
-        # Força o isolamento físico do upload injetando um carimbo temporal no nome do arquivo
         timestamp_upload = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         filename_seguro = f"{timestamp_upload}_{filename.replace(' ', '_')}"
         filepath = f"data/uploads/{filename_seguro}"
@@ -169,33 +172,28 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
         with open(filepath, "wb") as f:
             f.write(ficheiro.content)
 
-        # Etapa C: Inicia o processamento analítico a partir do novo arquivo isolado
         df = ingest(filepath)
-        cliente = carregar_cliente(phone_number)
+        cliente = carregar_cliente(numero_limpo)
         frequencia = cliente.get("frequencia", "semanal") if cliente else "semanal"
         
         metricas = calcular_metricas(df, frequencia_cliente=frequencia)
         nome_empresa = cliente["nome"] if cliente and cliente.get("nome") else "O meu negocio"
         
-        # Formatação exata do nome do relatório de saída (report_YYYYMMDD_HHMMSS_uuid.pdf)
         timestamp_label = datetime.now().strftime('%Y%m%d_%H%M%S')
         hash_unico = uuid.uuid4().hex[:6]
         pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
         
-        # Aciona a geração do PDF passando o nome já higienizado, imutável e seguro
         pdf_path = gerar_relatorio(metricas, nome_negocio=nome_empresa, semana_label=pdf_filename_limpo)
 
         base_url = os.getenv("BASE_URL")
         pdf_url = f"{base_url}/reports/{urllib.parse.quote(pdf_filename_limpo)}"
 
-        # Etapa D: Envia o documento recém-gerado de volta ao WhatsApp do cliente
         msg_envio = f"O teu relatório {frequencia} está pronto:"
-        main_function(phone_number, pdf_url, pdf_filename_limpo, mensagem=msg_envio)
+        main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=msg_envio)
 
-        # Etapa E: Vincula este ficheiro processado exclusivo como o 'ultimo_ficheiro' do cliente no JSON
         clientes = carregar_todos_clientes()
         for c in clientes:
-            if c["numero"] == phone_number:
+            if limpar_numero(c.get("numero")) == numero_limpo:
                 c["ultimo_ficheiro"] = filepath
                 break
         guardar_clientes(clientes)
@@ -208,16 +206,16 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
 
 def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTasks):
     """
-    Roteador de intenções de texto. Analisa o que o cliente digitou
-    e escolhe a ação ou resposta textual apropriada de forma imediata.
+    Roteador de intenções de texto. Identifica comandos analíticos base do chatbot.
     """
     texto_original = texto
     texto = texto.lower().strip()
-    cliente = carregar_cliente(phone_number)
+    numero_limpo = limpar_numero(phone_number)
+    cliente = carregar_cliente(numero_limpo)
 
     if not cliente:
         novo_cliente = {
-            "numero": phone_number,
+            "numero": numero_limpo,
             "nome": None,
             "negocio": None,
             "email": None,
@@ -229,28 +227,28 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         clientes = carregar_todos_clientes()
         clientes.append(novo_cliente)
         guardar_clientes(clientes)
-        enviar_mensagem(phone_number, "Bem-vindo ao InsightZone! Qual e o nome do teu negocio?")
+        enviar_mensagem(numero_limpo, "Bem-vindo ao InsightZone! Qual e o nome do teu negocio?")
         return
 
     if cliente["onboarding_passo"] > 0:
-        tratar_onboarding(phone_number, texto_original, cliente)
+        tratar_onboarding(numero_limpo, texto_original, cliente)
         return
 
     frequencia_atual = cliente.get("frequencia", "semanal")
 
     if texto in ["ola", "olá", "oi", "hello", "hi", "bom dia", "boa tarde", "boa noite"]:
-        enviar_mensagem(phone_number, MENU.format(frequencia=frequencia_atual.upper()))
+        enviar_mensagem(numero_limpo, MENU.format(frequencia=frequencia_atual.upper()))
         return
 
     if texto in ["relatorio", "relatório", "2"]:
         if not cliente.get("ultimo_ficheiro"):
-            enviar_mensagem(phone_number, "Ainda nao tens nenhum relatorio. Envia um ficheiro CSV, Excel ou PDF para comecar.")
+            enviar_mensagem(numero_limpo, "Ainda nao tens nenhum relatorio. Envia um ficheiro CSV, Excel ou PDF para comecar.")
             return
         
-        enviar_mensagem(phone_number, "A preparar o teu documento estratégico. Aguarda um momento...")
+        enviar_mensagem(numero_limpo, "A preparar o teu documento estratégico. Aguarda um momento...")
         background_tasks.add_task(
             gerar_relatorio_background, 
-            phone_number, 
+            numero_limpo, 
             cliente["ultimo_ficheiro"], 
             cliente["nome"], 
             frequencia_atual
@@ -259,7 +257,7 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
 
     if texto in ["resumo", "rapido", "rápido", "3"]:
         if not cliente.get("ultimo_ficheiro"):
-            enviar_mensagem(phone_number, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
+            enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
             return
         df = ingest(cliente["ultimo_ficheiro"])
         metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
@@ -278,28 +276,27 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
                 f"Total de transacoes: {metricas['total_transacoes']}\n"
                 f"Melhor dia: {metricas['melhor_dia']}"
             )
-        enviar_mensagem(phone_number, resumo)
+        enviar_mensagem(numero_limpo, resumo)
         return
 
     if texto in ["top", "top cinco", "top 5", "4"]:
         if not cliente.get("ultimo_ficheiro"):
-            enviar_mensagem(phone_number, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
+            enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
             return
         df = ingest(cliente["ultimo_ficheiro"])
         metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
         top = metricas["top_produtos_mes"] if frequencia_atual == "mensal" else metricas["top_produtos"]
         linhas = [f"{i+1}. {produto} — {int(qty)} unidades" for i, (produto, qty) in enumerate(top.items())]
-        enviar_mensagem(phone_number, f"Top 5 produtos ({frequencia_atual}):\n" + "\n".join(linhas))
+        enviar_mensagem(numero_limpo, f"Top 5 produtos ({frequencia_atual}):\n" + "\n".join(linhas))
         return
 
-    enviar_mensagem(phone_number, AJUDA)
+    enviar_mensagem(numero_limpo, AJUDA)
 
 
 # ── FASTAPI APPLICATION E ENDPOINTS ───────────────────────────────────────────
 
 app = FastAPI()
 
-# Serve publicamente a pasta de relatórios gerados para que a Meta consiga aceder e descarregar os PDFs
 app.mount("/reports", StaticFiles(directory="data/gold"), name="reports")
 
 
@@ -314,9 +311,8 @@ def verificar_webhook(
     hub_verify_token: str = Query(alias="hub.verify_token"),
     hub_challenge: str = Query(alias="hub.challenge")
 ):
-    """Rota de validação obrigatória exigida pela Meta para ativar o Webhook."""
+    """Rota de validação obrigatória exigida pela Meta."""
     if hub_mode == "subscribe" and hub_verify_token == os.getenv("WEBHOOK_VERIFY_TOKEN"):
-        # ATENÇÃO: Retorna o challenge diretamente como int/Response para evitar parsing com aspas adicionais
         return Response(content=str(hub_challenge), media_type="text/plain")
     raise HTTPException(status_code=403, detail="Token inválido")
 
@@ -325,7 +321,6 @@ def verificar_webhook(
 def receber_webhook(payload: dict, background_tasks: BackgroundTasks):
     """
     Ponto de entrada central de eventos do WhatsApp Cloud API.
-    Processa mensagens de texto e uploads de documentos em background sem travar o canal.
     """
     try:
         entry = payload.get("entry", [])[0]
@@ -336,8 +331,10 @@ def receber_webhook(payload: dict, background_tasks: BackgroundTasks):
             return Response(content="OK", status_code=200)
             
         mensagem = value["messages"][0]
-        phone_number = mensagem.get("from")
-        tipo = mensagem.get("type")  # CORREÇÃO: Variável unificada e limpa para evitar colisões
+        
+        # Correção central: O número passa por limpeza assim que entra no webhook
+        phone_number = limpar_numero(mensagem.get("from"))
+        tipo = mensagem.get("type")
         
     except (KeyError, IndexError, TypeError):
         return Response(content="OK", status_code=200)
@@ -352,7 +349,6 @@ def receber_webhook(payload: dict, background_tasks: BackgroundTasks):
             tratar_comando(phone_number, "novo", background_tasks)
             return Response(content="OK", status_code=200)
             
-        # CORREÇÃO: Captura segura do nó document
         doc_data = mensagem.get("document", {})
         document_id = doc_data.get("id")
         filename = doc_data.get("filename", f"vendas_{int(datetime.now().timestamp())}.xlsx")
