@@ -19,7 +19,7 @@ from pipeline.metrics import calcular_metricas
 from pipeline.reader import ingest
 from pipeline.report import gerar_relatorio
 from pipeline.sender import enviar_mensagem, main_function
-from pipeline.storage import upload_pdf
+from pipeline.storage import upload_pdf, upload_ficheiro_vendas, download_ficheiro
 
 load_dotenv()
 
@@ -76,7 +76,7 @@ def carregar_cliente(phone_number: str) -> dict | None:
         conn   = get_conn()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico "
+            "SELECT numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico, ultimo_ficheiro_url "
             "FROM clientes WHERE numero = %s",
             (numero_limpo,)
         )
@@ -86,13 +86,14 @@ def carregar_cliente(phone_number: str) -> dict | None:
         if not row:
             return None
         return {
-            "numero":              row[0],
-            "nome":                row[1],
-            "negocio":             row[2],
-            "frequencia":          row[3] or "semanal",
-            "ultimo_relatorio_url": row[4],   # URL do Cloudinary, não path local
-            "onboarding_passo":    row[5],
-            "historico":           json.loads(row[6]) if row[6] else [],
+            "numero":               row[0],
+            "nome":                 row[1],
+            "negocio":              row[2],
+            "frequencia":           row[3] or "semanal",
+            "ultimo_relatorio_url": row[4],
+            "onboarding_passo":     row[5],
+            "historico":            json.loads(row[6]) if row[6] else [],
+            "ultimo_ficheiro_url":  row[7],
         }
     except Exception as e:
         print(f"Erro ao carregar cliente: {e}")
@@ -256,11 +257,16 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
 
         pdf_path = gerar_relatorio(metricas, nome_negocio=nome_empresa, semana_label=pdf_filename_limpo)
 
-        # storage.py faz upload E apaga o ficheiro pdf local — não apagar aqui também
+        # Upload do PDF (storage.py apaga o ficheiro local)
         pdf_url = upload_pdf(pdf_path)
 
-        # BUG CORRIGIDO: guardar o URL do Cloudinary, não o path local do ficheiro de vendas
-        actualizar_cliente(numero_limpo, {"ultimo_relatorio_url": pdf_url})
+        # Upload do ficheiro de vendas para o Cloudinary (para recalcular resumo/top depois)
+        ficheiro_url = upload_ficheiro_vendas(filepath)
+
+        actualizar_cliente(numero_limpo, {
+            "ultimo_relatorio_url": pdf_url,
+            "ultimo_ficheiro_url":  ficheiro_url,
+        })
 
         main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=f"O teu relatorio {frequencia} esta pronto:")
         print("Pipeline concluido com sucesso!")
@@ -285,28 +291,68 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
 
 # ── RESUMO E TOP (background) ─────────────────────────────────────────────────
 
-def _resumo_background(numero_limpo: str, pdf_url: str, frequencia_atual: str):
-    """
-    BUG CORRIGIDO: resumo rápido baseado no último PDF URL (não num ficheiro local apagado).
-    Envia o URL do último relatório com uma mensagem de resumo contextual.
-    """
+def _carregar_df_cliente(numero_limpo: str, ficheiro_url: str):
+    """Descarrega o ficheiro de vendas do Cloudinary e devolve um DataFrame."""
+    import tempfile
+    ext = ficheiro_url.split(".")[-1].lower()
+    if ext not in ("csv", "xlsx", "xls", "pdf"):
+        ext = "xlsx"
+    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+        tmp_path = tmp.name
+    download_ficheiro(ficheiro_url, tmp_path)
+    df = ingest(tmp_path)
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    return df
+
+
+def _resumo_background(numero_limpo: str, ficheiro_url: str, frequencia_atual: str):
+    """Envia 3 KPIs rápidos recalculados a partir dos dados originais."""
     try:
-        if not pdf_url:
+        if not ficheiro_url:
             enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
             return
-        # Envia o último relatório guardado como "resumo rápido"
-        pdf_filename = pdf_url.split("/")[-1]
-        main_function(
-            numero_limpo, pdf_url, pdf_filename,
-            mensagem=f"Aqui tens o teu ultimo relatorio {frequencia_atual}:"
-        )
+        df       = _carregar_df_cliente(numero_limpo, ficheiro_url)
+        metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
+        if frequencia_atual == "mensal":
+            resumo = (
+                f"Resumo do Mes ({metricas['mes_nome']}):\n"
+                f"Faturacao total: {metricas['total_mensal']:.2f} MZN\n"
+                f"Transacoes: {metricas['transacoes_mensal']}\n"
+                f"Ticket medio: {metricas['ticket_medio_mensal']:.2f} MZN\n"
+                f"Melhor dia: {metricas['melhor_dia_mes']}"
+            )
+        else:
+            resumo = (
+                f"Resumo da semana:\n"
+                f"Faturacao total: {metricas['total']:.2f} MZN\n"
+                f"Transacoes: {metricas['total_transacoes']}\n"
+                f"Ticket medio: {metricas['ticket_medio']:.2f} MZN\n"
+                f"Melhor dia: {metricas['melhor_dia']}"
+            )
+        enviar_mensagem(numero_limpo, resumo)
     except Exception as e:
-        print(f"Erro ao enviar resumo: {e}")
+        print(f"Erro ao gerar resumo: {e}")
+        enviar_mensagem(numero_limpo, "Erro ao calcular o resumo. Tenta novamente.")
 
 
-def _top_background(numero_limpo: str, pdf_url: str, frequencia_atual: str):
-    """Reenvia o último relatório como resposta ao comando 'top'."""
-    _resumo_background(numero_limpo, pdf_url, frequencia_atual)
+def _top_background(numero_limpo: str, ficheiro_url: str, frequencia_atual: str):
+    """Envia o Top 5 produtos recalculado a partir dos dados originais."""
+    try:
+        if not ficheiro_url:
+            enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
+            return
+        df       = _carregar_df_cliente(numero_limpo, ficheiro_url)
+        metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
+        top      = metricas["top_produtos_mes"] if frequencia_atual == "mensal" else metricas["top_produtos"]
+        if not top or list(top.keys())[0] == "Nenhum produto detetado":
+            enviar_mensagem(numero_limpo, "Nao foi possivel identificar produtos no teu ficheiro.")
+            return
+        linhas = [f"{i+1}. {produto} — {int(qty)} unidades" for i, (produto, qty) in enumerate(top.items())]
+        enviar_mensagem(numero_limpo, f"Top 5 produtos ({frequencia_atual}):\n" + "\n".join(linhas))
+    except Exception as e:
+        print(f"Erro ao gerar top produtos: {e}")
+        enviar_mensagem(numero_limpo, "Erro ao calcular o top produtos. Tenta novamente.")
 
 
 # ── MOTOR DE COMANDOS ─────────────────────────────────────────────────────────
@@ -340,8 +386,9 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         tratar_onboarding(numero_limpo, texto_original, cliente)
         return
 
-    frequencia_atual    = cliente.get("frequencia", "semanal")
+    frequencia_atual     = cliente.get("frequencia", "semanal")
     ultimo_relatorio_url = cliente.get("ultimo_relatorio_url")
+    ultimo_ficheiro_url  = cliente.get("ultimo_ficheiro_url")
 
     if texto in ["ola", "olá", "oi", "hello", "hi", "bom dia", "boa tarde", "boa noite"]:
         enviar_mensagem(numero_limpo, MENU.format(frequencia=frequencia_atual.upper()))
@@ -359,20 +406,20 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         return
 
     if texto in ["resumo", "rapido", "rápido", "3"]:
-        if not ultimo_relatorio_url:
+        if not ultimo_ficheiro_url:
             enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
             return
         background_tasks.add_task(
-            _resumo_background, numero_limpo, ultimo_relatorio_url, frequencia_atual
+            _resumo_background, numero_limpo, ultimo_ficheiro_url, frequencia_atual
         )
         return
 
     if texto in ["top", "top cinco", "top 5", "4"]:
-        if not ultimo_relatorio_url:
+        if not ultimo_ficheiro_url:
             enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
             return
         background_tasks.add_task(
-            _top_background, numero_limpo, ultimo_relatorio_url, frequencia_atual
+            _top_background, numero_limpo, ultimo_ficheiro_url, frequencia_atual
         )
         return
 
@@ -439,7 +486,7 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
     except (KeyError, IndexError, TypeError):
         return Response(content="OK", status_code=200)
 
-    # Ignora mensagens já processadas
+    # Ignora mensagens já processadas (retries automáticos do Meta)
     if message_id and message_id in _mensagens_vistas:
         return Response(content="OK", status_code=200)
     if message_id:
@@ -454,7 +501,7 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
     elif tipo == "document":
         cliente = carregar_cliente(phone_number)
 
-        # se ainda em onboarding, tratar como texto "documento" não "novo"
+        # BUG CORRIGIDO: se ainda em onboarding, tratar como texto "documento" não "novo"
         if not cliente or cliente.get("onboarding_passo", 0) > 0:
             enviar_mensagem(
                 limpar_numero(phone_number),
