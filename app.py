@@ -3,16 +3,14 @@ import hashlib
 import hmac
 import json
 import os
-import urllib.parse
 import uuid
 from datetime import datetime
-
+from pipeline.storage import upload_pdf
 import httpx
 import psycopg2
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
-from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -116,7 +114,6 @@ def actualizar_cliente(numero_limpo: str, campos: dict):
     try:
         conn   = get_conn()
         cursor = conn.cursor()
-        # Constrói o SET dinamicamente só com os campos passados
         set_clause = ", ".join(f"{k} = %s" for k in campos)
         valores    = list(campos.values()) + [numero_limpo]
         cursor.execute(f"UPDATE clientes SET {set_clause} WHERE numero = %s", valores)
@@ -170,7 +167,7 @@ def tratar_onboarding(phone_number: str, texto: str, cliente: dict):
         enviar_mensagem(numero_limpo, "Como preferes receber os relatorios?\n1. Semanalmente\n2. Mensalmente")
 
     elif passo == 3:
-        freq_map  = {"1": "semanal", "2": "mensal"}
+        freq_map   = {"1": "semanal", "2": "mensal"}
         frequencia = freq_map.get(texto.strip(), "semanal")
         actualizar_cliente(numero_limpo, {"frequencia": frequencia, "onboarding_passo": 0})
         enviar_mensagem(numero_limpo, f"Perfeito! Onboarding completo. Configurado para envio {frequencia}.\nEnvia agora o teu ficheiro CSV, Excel ou PDF com os teus dados de vendas.")
@@ -187,8 +184,7 @@ def gerar_relatorio_background(phone_number: str, filepath: str, nome_cliente: s
         hash_unico         = uuid.uuid4().hex[:6]
         pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
         pdf_path           = gerar_relatorio(metricas, nome_negocio=nome_cliente, semana_label=pdf_filename_limpo)
-        base_url           = os.getenv("BASE_URL")
-        pdf_url            = f"{base_url}/reports/{urllib.parse.quote(pdf_filename_limpo)}"
+        pdf_url            = upload_pdf(pdf_path)
         main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=f"Aqui tens o teu relatório {frequencia_atual} atualizado:")
     except Exception as e:
         print(f"Erro ao gerar relatório em background: {e}")
@@ -233,13 +229,10 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
         pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
 
         pdf_path = gerar_relatorio(metricas, nome_negocio=nome_empresa, semana_label=pdf_filename_limpo)
-
-        base_url = os.getenv("BASE_URL")
-        pdf_url  = f"{base_url}/reports/{urllib.parse.quote(pdf_filename_limpo)}"
+        pdf_url  = upload_pdf(pdf_path)
 
         main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=f"O teu relatório {frequencia} está pronto:")
 
-        # Guarda o caminho do último ficheiro na base de dados
         actualizar_cliente(numero_limpo, {"ultimo_ficheiro": filepath})
         print("Pipeline concluído com sucesso!")
 
@@ -351,12 +344,16 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.mount("/reports", StaticFiles(directory="data/gold"), name="reports")
 
 
 @app.get("/")
 def read_root():
     return {"status": "healthy", "service": "InsightZone"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.get("/webhook")

@@ -14,6 +14,7 @@ Pillow==10.3.0
 pyarrow==16.1.0
 fastparquet==2024.5.0
 psycopg2-binary==2.9.9
+cloudinary==1.36.0
 
 # MOTOR DE RENDERIZAÇÃO DE PDF
 reportlab==4.2.0
