@@ -1,6 +1,6 @@
 # InsightZone WhatsApp
 
-Serviço de business intelligence entregue directamente pelo WhatsApp Business. O cliente envia um ficheiro de vendas e recebe automaticamente um relatório PDF profissional com os insights da semana ou do mês sem instalar nada, sem fazer login em nenhum portal, sem aprender nenhuma ferramenta nova.
+Serviço de business intelligence entregue directamente pelo WhatsApp Business. O cliente envia um ficheiro de vendas e recebe automaticamente um relatório PDF profissional com os insights da semana sem instalar nada, sem fazer login em nenhum portal, sem aprender nenhuma ferramenta nova.
 
 ---
 
@@ -16,6 +16,7 @@ Serviço de business intelligence entregue directamente pelo WhatsApp Business. 
 - [Comandos do Bot](#comandos-do-bot)
 - [Execução Local](#execução-local)
 - [Deploy em Produção](#deploy-em-produção)
+- [Troubleshooting](#troubleshooting)
 - [Modelo de Negócio](#modelo-de-negócio)
 
 ---
@@ -41,7 +42,7 @@ Meta Cloud API
     v
 FastAPI (app.py)
     |
-    |__ pipeline/reader.py      lê o ficheiro, devolve DataFrame
+    |__ pipeline/reader.py      lê o ficheiro, normaliza colunas, devolve DataFrame
     |__ pipeline/metrics.py     calcula métricas, guarda parquet
     |__ pipeline/report.py      gera PDF com ReportLab
     |__ pipeline/sender.py      envia PDF via Meta Cloud API
@@ -54,7 +55,7 @@ Cliente recebe PDF no WhatsApp
 
 O FastAPI responde imediatamente com `200 OK` à Meta e processa o ficheiro em background via `BackgroundTasks`, evitando timeouts no webhook.
 
-O APScheduler corre dentro do FastAPI e envia relatórios automaticamente de forma semanal e mensal para todos os clientes registados.
+O APScheduler corre dentro do FastAPI e envia relatórios automaticamente de forma semanal para todos os clientes registados.
 
 ---
 
@@ -104,6 +105,11 @@ BASE_URL=https://o-teu-url-publico.com
 4. Para produção, cria um token permanente através do System User no Business Manager
 5. Copia o Phone Number ID e o WhatsApp Business Account ID da mesma página
 
+> **Atenção:** O Phone Number ID e o WhatsApp Business Account ID são valores distintos. Confirma os valores correctos correndo este comando após configurar o `.env`:
+> ```bash
+> python -c "import httpx, os; from dotenv import load_dotenv; load_dotenv(); r = httpx.get('https://graph.facebook.com/v15.0/' + os.getenv('META_WABA_ID') + '/phone_numbers', headers={'Authorization': 'Bearer ' + os.getenv('META_ACCESS_TOKEN')}); print(r.json())"
+> ```
+
 ### Configurar o webhook
 
 1. Corre o servidor localmente com ngrok a expor a porta 8000
@@ -119,7 +125,7 @@ BASE_URL=https://o-teu-url-publico.com
 insightzone/
 |
 |__ app.py                  ponto de entrada FastAPI, webhook, comandos, onboarding
-|__ scheduler.py            APScheduler, envio automático semanal e mensal
+|__ scheduler.py            APScheduler, envio automático semanal
 |__ clientes.json           base de dados de clientes (número, negócio, histórico)
 |__ requirements.txt        dependências Python com versões fixas
 |__ .env                    credenciais (nunca commitar)
@@ -127,7 +133,7 @@ insightzone/
 |
 |__ pipeline/
 |   |__ __init__.py
-|   |__ reader.py           leitura de CSV, Excel e PDF
+|   |__ reader.py           leitura de CSV, Excel e PDF com normalização automática de colunas
 |   |__ metrics.py          cálculo de métricas de vendas
 |   |__ report.py           geração do relatório PDF com ReportLab
 |   |__ sender.py           envio de mensagens e PDFs via Meta API
@@ -137,8 +143,6 @@ insightzone/
 |   |__ silver/             dados processados após cálculo de métricas (parquet)
 |   |__ gold/               PDFs gerados, servidos publicamente em /reports/
 |   |__ uploads/            ficheiros temporários enviados pelos clientes
-|
-|__ static/                 assets estáticos
 ```
 
 ---
@@ -153,15 +157,18 @@ O pipeline segue a arquitectura medalhão (bronze, silver, gold):
 | Silver | DataFrame com métricas calculadas em parquet | `data/silver/` |
 | Gold | Relatório PDF pronto para entrega | `data/gold/` |
 
-### Schema mínimo do ficheiro do cliente
+### Schema do ficheiro do cliente
 
-| Coluna | Tipo | Exemplo | Obrigatória |
-|--------|------|---------|-------------|
-| data | texto ou data | 2026-05-17 | Sim |
-| produto | texto | Corte de cabelo | Sim |
-| quantidade | inteiro | 3 | Sim |
-| valor | decimal | 250.00 | Sim |
-| custo | decimal | 100.00 | Não |
+O bot identifica automaticamente as colunas do ficheiro enviado pelo cliente usando heurística não é necessário seguir um formato exacto. O schema abaixo é o formato recomendado para melhores resultados:
+
+| Coluna | Tipo | Exemplo |
+|--------|------|---------|
+| data | texto ou data | 2026-05-17 |
+| produto | texto | Frango Grelhado |
+| quantidade | inteiro | 3 |
+| valor | decimal | 250.00 |
+
+Colunas com nomes alternativos como `Date`, `Item`, `Qty`, `Total`, `Price`, `Description` são detectadas e mapeadas automaticamente.
 
 ### Métricas calculadas
 
@@ -169,7 +176,6 @@ O pipeline segue a arquitectura medalhão (bronze, silver, gold):
 - Total de transacções
 - Ticket médio por transacção
 - Melhor dia do período
-- Pior dia do período
 - Top 5 produtos por quantidade
 - Variação percentual face ao período anterior (quando disponível)
 
@@ -179,20 +185,19 @@ O pipeline segue a arquitectura medalhão (bronze, silver, gold):
 
 | O cliente envia | O bot responde |
 |----------------|---------------|
-| olá / oi / hello | Menu de opções |
+| olá / oi / hello / bom dia | Menu de opções |
 | ficheiro CSV ou Excel | Processamento automático e entrega do PDF |
 | resumo / 3 | Três KPIs principais em texto simples |
 | relatório / 2 | PDF do último relatório gerado |
 | top / 4 | Top 5 produtos do período |
-| ajuda / 0 | Menu completo de comandos |
 
 ### Onboarding
 
-Quando um número novo envia a primeira mensagem, o bot inicia um fluxo de onboarding de três passos antes de aceitar ficheiros:
+Quando um número novo envia a primeira mensagem (texto ou ficheiro), o bot inicia um fluxo de onboarding de três passos antes de aceitar ficheiros:
 
 1. Nome do negócio
 2. Tipo de negócio (Serviços, Retalho, Agropecuária, Outro)
-3. Email de backup (opcional)
+3. Email de backup (opcional — envia `skip` para ignorar)
 
 O estado do onboarding é persistido em `clientes.json` através do campo `onboarding_passo`.
 
@@ -236,6 +241,41 @@ Todas as variáveis do `.env` devem ser configuradas no painel de variáveis de 
 
 ---
 
+## Troubleshooting
+
+**`401 Session has expired`**
+O token da Meta expirou. Vai a developers.facebook.com → InsightZone → API Setup e gera um novo token. Substitui no `.env` e reinicia o servidor.
+
+**`Object with ID '...' does not exist`**
+O `META_PHONE_NUMBER_ID` está errado. Corre o comando de verificação de credenciais acima para obter o ID correcto associado ao teu WABA.
+
+**`ImportError: Unable to find a usable engine` (pyarrow)**
+```bash
+pip install setuptools
+pip install pyarrow
+```
+
+**`ValueError: Colunas em falta`**
+O ficheiro enviado não tem colunas reconhecíveis. O bot tenta mapear automaticamente mas se as colunas tiverem nomes muito incomuns pode falhar. Verifica o output do terminal para ver o mapeamento tentado e adiciona as palavras-chave ao `MAPA_HEURISTICA` em `reader.py`.
+
+**Webhook não verifica (`403 Token inválido`)**
+Confirma que o `WEBHOOK_VERIFY_TOKEN` no `.env` é exactamente igual ao valor preenchido no campo "Verify Token" no dashboard da Meta.
+
+**Bot não responde após mensagem**
+Verifica se o campo `messages` está subscrito no dashboard da Meta em Configuration → Webhook fields.
+
+---
+
+## Considerações de Segurança
+
+- O ficheiro `.env` está incluído no `.gitignore` e nunca deve ser commitado
+- O token de acesso da Meta deve ser rotacionado regularmente
+- O `WEBHOOK_VERIFY_TOKEN` deve ser uma string aleatória e difícil de adivinhar
+- Em produção, implementar validação da assinatura HMAC-SHA256 enviada pela Meta no header `X-Hub-Signature-256` de cada webhook POST
+- Em produção, considerar rate limiting no endpoint `/webhook` para evitar abuso
+
+---
+
 ## Modelo de Negócio
 
 | Plano | Preço mensal | Inclui |
@@ -253,15 +293,6 @@ Todas as variáveis do `.env` devem ser configuradas no painel de variáveis de 
 | Total | $0.00 |
 
 Com 10 clientes no plano Básico: $100/mês de receita com margem bruta de 100%.
-
----
-
-## Considerações de Segurança
-
-- O ficheiro `.env` está incluído no `.gitignore` e nunca deve ser commitado
-- O token de acesso da Meta deve ser rotacionado regularmente
-- O `WEBHOOK_VERIFY_TOKEN` deve ser uma string aleatória e difícil de adivinhar
-- Em produção, considerar rate limiting no endpoint `/webhook` para evitar abuso
 
 ---
 
