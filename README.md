@@ -165,7 +165,7 @@ O pipeline segue a arquitectura medalhão (bronze, silver, gold):
 
 ### Schema do ficheiro do cliente
 
-O bot identifica automaticamente as colunas do ficheiro enviado pelo cliente usando heurística — não é necessário seguir um formato exacto. O schema abaixo é o formato recomendado para melhores resultados:
+O bot identifica automaticamente as colunas do ficheiro enviado pelo cliente usando heurística não é necessário seguir um formato exacto. O schema abaixo é o formato recomendado para melhores resultados:
 
 | Coluna | Tipo | Exemplo |
 |--------|------|---------|
@@ -286,19 +286,18 @@ O token de acesso da Meta expira a cada 24 horas em modo de desenvolvimento. Par
 
 ## Deploy em Produção
 
-### Railway
+### Render
 
-```bash
-# Instalar Railway CLI
-npm install -g @railway/cli
+1. No dashboard do Render clica em **New + → Web Service**
+2. Liga ao teu repositório GitHub
+3. Configura:
+   - **Environment:** Python
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `uvicorn app:app --host 0.0.0.0 --port $PORT`
+4. Em **Environment Variables**, adiciona todas as variáveis do `.env`
+5. Clica **Deploy**
 
-# Login e deploy
-railway login
-railway init
-railway up
-```
-
-Define as variáveis de ambiente no dashboard do Railway e actualiza o `BASE_URL` com o URL público atribuído.
+Qualquer push para o branch `main` no GitHub dispara um deploy automático no Render.
 
 ### Variáveis de ambiente em produção
 
@@ -364,7 +363,7 @@ O servidor reiniciou por falta de memória. O pipeline já usa `gc.collect()` e 
 | Item | Custo mensal |
 |------|-------------|
 | Meta Cloud API (menos de 1.000 conversas) | $0.00 |
-| Railway / Render.com (free tier) | $0.00 |
+| Render.com (free tier) | $0.00 |
 | PostgreSQL (free tier) | $0.00 |
 | Total | $0.00 |
 
