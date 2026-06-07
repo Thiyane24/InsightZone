@@ -1,26 +1,33 @@
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Response
-from fastapi.staticfiles import StaticFiles
-import os
-import httpx
-from datetime import datetime, date
-import time
-import uuid  # Para garantir unicidade matemática e imutabilidade dos relatórios
-from dotenv import load_dotenv
+import gc
+import hashlib
+import hmac
 import json
+import os
 import urllib.parse
-from pipeline.reader import ingest
-from pipeline.metrics import calcular_metricas
-from pipeline.report import gerar_relatorio
-from pipeline.sender import main_function, enviar_mensagem
+import uuid
+from datetime import datetime
 
-# Carrega as variáveis de ambiente declaradas no ficheiro .env
+import httpx
+import psycopg2
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+from pipeline.metrics import calcular_metricas
+from pipeline.reader import ingest
+from pipeline.report import gerar_relatorio
+from pipeline.sender import enviar_mensagem, main_function
+
 load_dotenv()
 
-# Definição de templates de texto estáticos para interação com o utilizador
 MENU = """Ola! Sou o InsightZone.
 Modo atual: {frequencia}
 
-1. Enviar ficheiro de vendas in formato CSV, Excel ou PDF para receber o relatorio.
+1. Enviar ficheiro de vendas em formato CSV, Excel ou PDF para receber o relatorio.
 2. Ver relatorio anterior
 3. Resumo rapido
 4. Top 5 produtos"""
@@ -32,201 +39,232 @@ AJUDA = """Comandos disponiveis:
 - 'top' ou '4' — top 5 produtos"""
 
 
-# ── JSON HELPERS (PERSISTÊNCIA LOCAL DE CLIENTES COM HIGIENIZAÇÃO) ───────────
+# ── SEGURANÇA SHA-256 ─────────────────────────────────────────────────────────
+
+def verificar_assinatura_meta(payload_bytes: bytes, signature_header: str) -> bool:
+    secret = os.getenv("META_APP_SECRET", "")
+    if not secret:
+        print("Aviso: META_APP_SECRET não configurado no .env")
+        return False
+    expected = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature_header)
+
+
+# ── BASE DE DADOS ─────────────────────────────────────────────────────────────
+
+def get_conn():
+    """Abre uma ligação à base de dados PostgreSQL."""
+    return psycopg2.connect(os.getenv("DATABASE_URL"))
+
 
 def limpar_numero(phone_number: str) -> str:
-    """Garante que o número contém apenas dígitos, eliminando o símbolo '+' ou espaços."""
     if not phone_number:
         return ""
     return str(phone_number).replace("+", "").strip()
 
-def carregar_todos_clientes() -> list:
-    """Carrega a base de dados local em JSON. Se não existir, cria um ficheiro vazio."""
-    if not os.path.exists("clientes.json"):
-        with open("clientes.json", "w", encoding="utf-8") as f:
-            json.dump([], f)
-    with open("clientes.json", "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return []
-
-def guardar_clientes(clientes: list):
-    """Grava as atualizações do estado dos clientes de volta no ficheiro JSON."""
-    with open("clientes.json", "w", encoding="utf-8") as f:
-        json.dump(clientes, f, ensure_ascii=False, indent=2)
 
 def carregar_cliente(phone_number: str) -> dict | None:
-    """Procura e retorna o perfil de um cliente específico com base no número higienizado."""
+    """Busca um cliente pelo número. Devolve dict ou None se não existir."""
     numero_limpo = limpar_numero(phone_number)
-    for cliente in carregar_todos_clientes():
-        if limpar_numero(cliente.get("numero")) == numero_limpo:
-            return cliente
-    return None
+    try:
+        conn   = get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT numero, nome, negocio, frequencia, ultimo_ficheiro, onboarding_passo, historico FROM clientes WHERE numero = %s", (numero_limpo,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "numero":           row[0],
+            "nome":             row[1],
+            "negocio":          row[2],
+            "frequencia":       row[3] or "semanal",
+            "ultimo_ficheiro":  row[4],
+            "onboarding_passo": row[5],
+            "historico":        json.loads(row[6]) if row[6] else [],
+        }
+    except Exception as e:
+        print(f"Erro ao carregar cliente: {e}")
+        return None
 
 
-# ── MÁQUINA DE ESTADOS DO ONBOARDING ──────────────────────────────────────────
+def criar_cliente(numero_limpo: str):
+    """Insere um novo cliente na base de dados."""
+    try:
+        conn   = get_conn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO clientes (numero, nome, negocio, frequencia, ultimo_ficheiro, onboarding_passo, historico)
+            VALUES (%s, NULL, NULL, 'semanal', NULL, 1, '[]')
+            ON CONFLICT (numero) DO NOTHING
+        """, (numero_limpo,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Erro ao criar cliente: {e}")
+
+
+def actualizar_cliente(numero_limpo: str, campos: dict):
+    """
+    Actualiza campos específicos de um cliente.
+    Exemplo: actualizar_cliente(numero, {"nome": "Mercado X", "onboarding_passo": 2})
+    """
+    if not campos:
+        return
+    try:
+        conn   = get_conn()
+        cursor = conn.cursor()
+        # Constrói o SET dinamicamente só com os campos passados
+        set_clause = ", ".join(f"{k} = %s" for k in campos)
+        valores    = list(campos.values()) + [numero_limpo]
+        cursor.execute(f"UPDATE clientes SET {set_clause} WHERE numero = %s", valores)
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Erro ao actualizar cliente: {e}")
+
+
+def carregar_todos_clientes() -> list:
+    """Devolve todos os clientes — usado pelo scheduler."""
+    try:
+        conn   = get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT numero, nome, negocio, frequencia, ultimo_ficheiro, onboarding_passo, historico FROM clientes")
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return [
+            {
+                "numero":           r[0],
+                "nome":             r[1],
+                "negocio":          r[2],
+                "frequencia":       r[3] or "semanal",
+                "ultimo_ficheiro":  r[4],
+                "onboarding_passo": r[5],
+                "historico":        json.loads(r[6]) if r[6] else [],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"Erro ao carregar todos os clientes: {e}")
+        return []
+
+
+# ── ONBOARDING ────────────────────────────────────────────────────────────────
 
 def tratar_onboarding(phone_number: str, texto: str, cliente: dict):
-    """
-    Gere o fluxo passo-a-passo de boas-vindas do cliente (Onboarding).
-    Salva o progresso no JSON e envia a próxima pergunta correspondente.
-    """
-    clientes = carregar_todos_clientes()
-    passo = cliente["onboarding_passo"]
+    passo        = cliente["onboarding_passo"]
     numero_limpo = limpar_numero(phone_number)
 
     if passo == 1:
-        for c in clientes:
-            if limpar_numero(c.get("numero")) == numero_limpo:
-                c["nome"] = texto
-                c["onboarding_passo"] = 2
-                break
-        guardar_clientes(clientes)
-        enviar_mensagem(numero_limpo, "Que tipo de negocio tens?\n1. Servicos\n2. Retalho\n3. Agropecuaria\n4. Outro")
+        actualizar_cliente(numero_limpo, {"nome": texto, "onboarding_passo": 2})
+        enviar_mensagem(numero_limpo, "Que tipo de negocio tens?\n1. Servicos\n2. Retalho (Alimentar, Vestuário, Eletrónica)\n3. Agropecuaria\n4. Outro")
 
     elif passo == 2:
-        tipos = {"1": "servicos", "2": "retalho", "3": "agropecuaria", "4": "outro"}
+        tipos   = {"1": "servicos", "2": "retalho", "3": "agropecuaria", "4": "outro"}
         negocio = tipos.get(texto.strip(), texto.strip())
-        for c in clientes:
-            if limpar_numero(c.get("numero")) == numero_limpo:
-                c["negocio"] = negocio
-                c["onboarding_passo"] = 3
-                break
-        guardar_clientes(clientes)
-        enviar_mensagem(numero_limpo, "Qual e o teu email para relatorios de backup? (envia 'skip' para ignorar)")
+        actualizar_cliente(numero_limpo, {"negocio": negocio, "onboarding_passo": 3})
+        enviar_mensagem(numero_limpo, "Como preferes receber os relatorios?\n1. Semanalmente\n2. Mensalmente")
 
     elif passo == 3:
-        email = None if texto.strip().lower() == "skip" else texto.strip()
-        for c in clientes:
-            if limpar_numero(c.get("numero")) == numero_limpo:
-                c["email"] = email
-                c["onboarding_passo"] = 4
-                break
-        guardar_clientes(clientes)
-        enviar_mensagem(numero_limpo, "Como preferes enviar os teus dados e receber os relatorios?\n1. Semanalmente\n2. Mensalmente")
-
-    elif passo == 4:
-        freq_map = {"1": "semanal", "2": "mensal"}
+        freq_map  = {"1": "semanal", "2": "mensal"}
         frequencia = freq_map.get(texto.strip(), "semanal")
-        for c in clientes:
-            if limpar_numero(c.get("numero")) == numero_limpo:
-                c["frequencia"] = frequencia
-                c["onboarding_passo"] = 0
-                break
-        guardar_clientes(clientes)
+        actualizar_cliente(numero_limpo, {"frequencia": frequencia, "onboarding_passo": 0})
         enviar_mensagem(numero_limpo, f"Perfeito! Onboarding completo. Configurado para envio {frequencia}.\nEnvia agora o teu ficheiro CSV, Excel ou PDF com os teus dados de vendas.")
 
 
-# ── TAREFAS ASSÍNCRONAS EM SEGUNDO PLANO (BACKGROUND TASKS) ────────────────────
+# ── BACKGROUND TASKS ──────────────────────────────────────────────────────────
 
 def gerar_relatorio_background(phone_number: str, filepath: str, nome_cliente: str, frequencia_atual: str):
-    """
-    Executa o pipeline pesado de dados fora do fluxo principal da rota HTTP.
-    """
     try:
-        numero_limpo = limpar_numero(phone_number)
-        df = ingest(filepath)
-        metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
-        
-        timestamp_label = datetime.now().strftime('%Y%m%d_%H%M%S')
-        hash_unico = uuid.uuid4().hex[:6]
+        numero_limpo       = limpar_numero(phone_number)
+        df                 = ingest(filepath)
+        metricas           = calcular_metricas(df, frequencia_cliente=frequencia_atual)
+        timestamp_label    = datetime.now().strftime('%Y%m%d_%H%M%S')
+        hash_unico         = uuid.uuid4().hex[:6]
         pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
-        
-        pdf_path = gerar_relatorio(metricas, nome_negocio=nome_cliente, semana_label=pdf_filename_limpo)
-        
-        base_url = os.getenv("BASE_URL")
-        pdf_url = f"{base_url}/reports/{urllib.parse.quote(pdf_filename_limpo)}"
-        
-        msg_envio = f"Aqui tens o teu relatório {frequencia_atual} atualizado:"
-        main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=msg_envio)
+        pdf_path           = gerar_relatorio(metricas, nome_negocio=nome_cliente, semana_label=pdf_filename_limpo)
+        base_url           = os.getenv("BASE_URL")
+        pdf_url            = f"{base_url}/reports/{urllib.parse.quote(pdf_filename_limpo)}"
+        main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=f"Aqui tens o teu relatório {frequencia_atual} atualizado:")
     except Exception as e:
-        print(f"Erro ao processar relatório por texto em background: {e}")
+        print(f"Erro ao gerar relatório em background: {e}")
 
 
 def processar_ficheiro(phone_number: str, document_id: str, filename: str):
-    """
-    Descarrega o documento da API Graph da Meta v25.0, roda o pipeline analítico
-    e envia o PDF estratégico de volta ao utilizador de forma síncrona/segura.
-    """
+    filepath = None
     try:
-        token = os.getenv("META_ACCESS_TOKEN")
+        token        = os.getenv("META_ACCESS_TOKEN")
         numero_limpo = limpar_numero(phone_number)
 
-        # Atualizado para v25.0 correspondente ao teu painel Meta developers
-        meta_url = f"https://graph.facebook.com/v25.0/{document_id}"
-        r = httpx.get(meta_url, headers={"Authorization": f"Bearer {token}"})
+        meta_url     = f"https://graph.facebook.com/v25.0/{document_id}"
+        r            = httpx.get(meta_url, headers={"Authorization": f"Bearer {token}"})
         download_url = r.json().get("url")
 
         if not download_url:
-            print(f"Erro: Não foi possível obter a URL de download da Meta. Resposta: {r.text}")
+            print(f"Erro: URL de download não obtida. Resposta: {r.text}")
             return
 
         ficheiro = httpx.get(download_url, headers={"Authorization": f"Bearer {token}"})
         os.makedirs("data/uploads", exist_ok=True)
-        
+
         timestamp_upload = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        filename_seguro = f"{timestamp_upload}_{filename.replace(' ', '_')}"
-        filepath = f"data/uploads/{filename_seguro}"
-        
+        filename_seguro  = f"{timestamp_upload}_{filename.replace(' ', '_')}"
+        filepath         = f"data/uploads/{filename_seguro}"
+
         with open(filepath, "wb") as f:
             f.write(ficheiro.content)
 
-        df = ingest(filepath)
-        cliente = carregar_cliente(numero_limpo)
+        del ficheiro
+        gc.collect()
+
+        df         = ingest(filepath)
+        cliente    = carregar_cliente(numero_limpo)
         frequencia = cliente.get("frequencia", "semanal") if cliente else "semanal"
-        
-        metricas = calcular_metricas(df, frequencia_cliente=frequencia)
+
+        metricas     = calcular_metricas(df, frequencia_cliente=frequencia)
         nome_empresa = cliente["nome"] if cliente and cliente.get("nome") else "O meu negocio"
-        
-        timestamp_label = datetime.now().strftime('%Y%m%d_%H%M%S')
-        hash_unico = uuid.uuid4().hex[:6]
+
+        timestamp_label    = datetime.now().strftime('%Y%m%d_%H%M%S')
+        hash_unico         = uuid.uuid4().hex[:6]
         pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
-        
+
         pdf_path = gerar_relatorio(metricas, nome_negocio=nome_empresa, semana_label=pdf_filename_limpo)
 
         base_url = os.getenv("BASE_URL")
-        pdf_url = f"{base_url}/reports/{urllib.parse.quote(pdf_filename_limpo)}"
+        pdf_url  = f"{base_url}/reports/{urllib.parse.quote(pdf_filename_limpo)}"
 
-        msg_envio = f"O teu relatório {frequencia} está pronto:"
-        main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=msg_envio)
+        main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=f"O teu relatório {frequencia} está pronto:")
 
-        clientes = carregar_todos_clientes()
-        for c in clientes:
-            if limpar_numero(c.get("numero")) == numero_limpo:
-                c["ultimo_ficheiro"] = filepath
-                break
-        guardar_clientes(clientes)
-        print("Pipeline executado com sucesso através de upload de ficheiro!")
+        # Guarda o caminho do último ficheiro na base de dados
+        actualizar_cliente(numero_limpo, {"ultimo_ficheiro": filepath})
+        print("Pipeline concluído com sucesso!")
+
     except Exception as e:
         print(f"Erro ao processar ficheiro em background: {e}")
 
+    finally:
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                print(f"Ficheiro temporário removido: {filepath}")
+            except Exception as cleanup_err:
+                print(f"Aviso: não foi possível remover {filepath}: {cleanup_err}")
 
-# ── MOTOR DE COMANDOS DE TEXTO ────────────────────────────────────────────────
+
+# ── MOTOR DE COMANDOS ─────────────────────────────────────────────────────────
 
 def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTasks):
-    """
-    Roteador de intenções de texto. Identifica comandos analíticos base do chatbot.
-    """
     texto_original = texto
-    texto = texto.lower().strip()
-    numero_limpo = limpar_numero(phone_number)
-    cliente = carregar_cliente(numero_limpo)
+    texto          = texto.lower().strip()
+    numero_limpo   = limpar_numero(phone_number)
+    cliente        = carregar_cliente(numero_limpo)
 
     if not cliente:
-        novo_cliente = {
-            "numero": numero_limpo,
-            "nome": None,
-            "negocio": None,
-            "email": None,
-            "ultimo_ficheiro": None,
-            "historico": [],
-            "onboarding_passo": 1,
-            "frequencia": "semanal"
-        }
-        clientes = carregar_todos_clientes()
-        clientes.append(novo_cliente)
-        guardar_clientes(clientes)
+        criar_cliente(numero_limpo)
         enviar_mensagem(numero_limpo, "Bem-vindo ao InsightZone! Qual e o nome do teu negocio?")
         return
 
@@ -244,14 +282,10 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         if not cliente.get("ultimo_ficheiro"):
             enviar_mensagem(numero_limpo, "Ainda nao tens nenhum relatorio. Envia um ficheiro CSV, Excel ou PDF para comecar.")
             return
-        
         enviar_mensagem(numero_limpo, "A preparar o teu documento estratégico. Aguarda um momento...")
         background_tasks.add_task(
-            gerar_relatorio_background, 
-            numero_limpo, 
-            cliente["ultimo_ficheiro"], 
-            cliente["nome"], 
-            frequencia_atual
+            gerar_relatorio_background,
+            numero_limpo, cliente["ultimo_ficheiro"], cliente["nome"], frequencia_atual
         )
         return
 
@@ -259,9 +293,27 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         if not cliente.get("ultimo_ficheiro"):
             enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
             return
-        df = ingest(cliente["ultimo_ficheiro"])
+        background_tasks.add_task(
+            _resumo_background, numero_limpo, cliente["ultimo_ficheiro"], frequencia_atual
+        )
+        return
+
+    if texto in ["top", "top cinco", "top 5", "4"]:
+        if not cliente.get("ultimo_ficheiro"):
+            enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
+            return
+        background_tasks.add_task(
+            _top_background, numero_limpo, cliente["ultimo_ficheiro"], frequencia_atual
+        )
+        return
+
+    enviar_mensagem(numero_limpo, AJUDA)
+
+
+def _resumo_background(numero_limpo: str, ultimo_ficheiro: str, frequencia_atual: str):
+    try:
+        df       = ingest(ultimo_ficheiro)
         metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
-        
         if frequencia_atual == "mensal":
             resumo = (
                 f"Resumo do Mes ({metricas['mes_nome']}):\n"
@@ -277,26 +329,28 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
                 f"Melhor dia: {metricas['melhor_dia']}"
             )
         enviar_mensagem(numero_limpo, resumo)
-        return
+    except Exception as e:
+        print(f"Erro ao gerar resumo: {e}")
 
-    if texto in ["top", "top cinco", "top 5", "4"]:
-        if not cliente.get("ultimo_ficheiro"):
-            enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
-            return
-        df = ingest(cliente["ultimo_ficheiro"])
+
+def _top_background(numero_limpo: str, ultimo_ficheiro: str, frequencia_atual: str):
+    try:
+        df       = ingest(ultimo_ficheiro)
         metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
-        top = metricas["top_produtos_mes"] if frequencia_atual == "mensal" else metricas["top_produtos"]
-        linhas = [f"{i+1}. {produto} — {int(qty)} unidades" for i, (produto, qty) in enumerate(top.items())]
+        top      = metricas["top_produtos_mes"] if frequencia_atual == "mensal" else metricas["top_produtos"]
+        linhas   = [f"{i+1}. {produto} — {int(qty)} unidades" for i, (produto, qty) in enumerate(top.items())]
         enviar_mensagem(numero_limpo, f"Top 5 produtos ({frequencia_atual}):\n" + "\n".join(linhas))
-        return
+    except Exception as e:
+        print(f"Erro ao gerar top produtos: {e}")
 
-    enviar_mensagem(numero_limpo, AJUDA)
 
+# ── FASTAPI ───────────────────────────────────────────────────────────────────
 
-# ── FASTAPI APPLICATION E ENDPOINTS ───────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI()
-
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.mount("/reports", StaticFiles(directory="data/gold"), name="reports")
 
 
@@ -309,33 +363,39 @@ def read_root():
 def verificar_webhook(
     hub_mode: str = Query(alias="hub.mode"),
     hub_verify_token: str = Query(alias="hub.verify_token"),
-    hub_challenge: str = Query(alias="hub.challenge")
+    hub_challenge: str = Query(alias="hub.challenge"),
 ):
-    """Rota de validação obrigatória exigida pela Meta."""
     if hub_mode == "subscribe" and hub_verify_token == os.getenv("WEBHOOK_VERIFY_TOKEN"):
         return Response(content=str(hub_challenge), media_type="text/plain")
     raise HTTPException(status_code=403, detail="Token inválido")
 
 
 @app.post("/webhook")
-def receber_webhook(payload: dict, background_tasks: BackgroundTasks):
-    """
-    Ponto de entrada central de eventos do WhatsApp Cloud API.
-    """
+@limiter.limit("20/minute")
+async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
+    body = await request.body()
+
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not verificar_assinatura_meta(body, signature):
+        raise HTTPException(status_code=403, detail="Assinatura inválida")
+
     try:
-        entry = payload.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
-        
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return Response(content="OK", status_code=200)
+
+    try:
+        entry        = payload.get("entry", [])[0]
+        changes      = entry.get("changes", [])[0]
+        value        = changes.get("value", {})
+
         if "messages" not in value:
             return Response(content="OK", status_code=200)
-            
-        mensagem = value["messages"][0]
-        
-        # Correção central: O número passa por limpeza assim que entra no webhook
+
+        mensagem     = value["messages"][0]
         phone_number = limpar_numero(mensagem.get("from"))
-        tipo = mensagem.get("type")
-        
+        tipo         = mensagem.get("type")
+
     except (KeyError, IndexError, TypeError):
         return Response(content="OK", status_code=200)
 
@@ -348,11 +408,11 @@ def receber_webhook(payload: dict, background_tasks: BackgroundTasks):
         if not cliente or cliente.get("onboarding_passo", 0) > 0:
             tratar_comando(phone_number, "novo", background_tasks)
             return Response(content="OK", status_code=200)
-            
-        doc_data = mensagem.get("document", {})
+
+        doc_data    = mensagem.get("document", {})
         document_id = doc_data.get("id")
-        filename = doc_data.get("filename", f"vendas_{int(datetime.now().timestamp())}.xlsx")
-        
+        filename    = doc_data.get("filename", f"vendas_{int(datetime.now().timestamp())}.xlsx")
+
         if document_id:
             background_tasks.add_task(processar_ficheiro, phone_number, document_id, filename)
 
