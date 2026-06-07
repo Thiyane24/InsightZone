@@ -47,10 +47,11 @@ FastAPI (app.py)
     |__ pipeline/reader.py      lê o ficheiro, normaliza colunas, devolve DataFrame
     |__ pipeline/metrics.py     calcula métricas, liberta DataFrame com gc.collect()
     |__ pipeline/report.py      gera PDF com ReportLab (imports lazy)
+    |__ pipeline/storage.py     faz upload do PDF para o Cloudinary, devolve URL público
     |__ pipeline/sender.py      envia PDF via Meta Cloud API
     |
-    | PDF gerado em data/gold/
-    | servido em /reports/ via StaticFiles
+    | PDF enviado para Cloudinary
+    | URL permanente enviado ao cliente pelo WhatsApp
     v
 Cliente recebe PDF no WhatsApp
 ```
@@ -65,7 +66,8 @@ O APScheduler corre dentro do FastAPI e envia relatórios automaticamente de for
 
 - Python 3.11 ou superior
 - Conta Meta for Developers com app WhatsApp Business configurada
-- Base de dados PostgreSQL (Render ou Railway — free tier disponível)
+- Base de dados PostgreSQL (Render  free tier disponível)
+- Conta Cloudinary para armazenamento de PDFs (free tier disponível)
 - ngrok (para desenvolvimento local) ou servidor com URL público (produção)
 
 ---
@@ -100,6 +102,9 @@ META_APP_SECRET=o_teu_app_secret
 WEBHOOK_VERIFY_TOKEN=token_que_defines
 BASE_URL=https://o-teu-url-publico.com
 DATABASE_URL=postgresql://user:password@host:5432/insightzone_db
+CLOUDINARY_CLOUD_NAME=o_teu_cloud_name
+CLOUDINARY_API_KEY=a_tua_api_key
+CLOUDINARY_API_SECRET=o_teu_api_secret
 ```
 
 ### Obter as credenciais Meta
@@ -115,6 +120,12 @@ DATABASE_URL=postgresql://user:password@host:5432/insightzone_db
 > ```bash
 > python -c "import httpx, os; from dotenv import load_dotenv; load_dotenv(); r = httpx.get('https://graph.facebook.com/v15.0/' + os.getenv('META_WABA_ID') + '/phone_numbers', headers={'Authorization': 'Bearer ' + os.getenv('META_ACCESS_TOKEN')}); print(r.json())"
 > ```
+
+### Obter as credenciais Cloudinary
+
+1. Cria conta gratuita em [cloudinary.com](https://cloudinary.com)
+2. No dashboard vai a **Settings → API Keys**
+3. Copia `Cloud Name`, `API Key` e `API Secret` para o `.env`
 
 ### Configurar o webhook
 
@@ -142,14 +153,14 @@ insightzone/
 |   |__ reader.py           leitura de CSV, Excel e PDF com normalização automática de colunas
 |   |__ metrics.py          cálculo de métricas de vendas, libertação de memória com gc
 |   |__ report.py           geração do relatório PDF com ReportLab (imports lazy)
-|   |__ sender.py           envio de mensagens e PDFs via Meta API
+|   |__ storage.py          upload de PDFs para o Cloudinary, devolve URL público permanente
+|   |__ sender.py           envio de mensagens e PDFs via Meta API, com retry automático
 |
 |__ data/
-|   |__ bronze/             ficheiros brutos após ingestão (parquet)
-|   |__ silver/             dados processados após cálculo de métricas (parquet)
-|   |__ gold/               PDFs gerados, servidos publicamente em /reports/
 |   |__ uploads/            ficheiros temporários — apagados automaticamente após processamento
 ```
+
+> **Nota:** O sistema de ficheiros do Render é efémero ficheiros guardados em disco desaparecem a cada deploy ou restart. Os PDFs são enviados para o Cloudinary imediatamente após geração e o ficheiro local é apagado. Apenas a pasta `data/uploads/` é usada, exclusivamente para ficheiros temporários durante o processamento.
 
 ---
 
@@ -157,11 +168,11 @@ insightzone/
 
 O pipeline segue a arquitectura medalhão (bronze, silver, gold):
 
-| Camada | Responsabilidade | Localização |
-|--------|-----------------|-------------|
-| Bronze | Ficheiro bruto do cliente convertido em parquet | `data/bronze/` |
-| Silver | DataFrame com métricas calculadas em parquet | `data/silver/` |
-| Gold | Relatório PDF pronto para entrega | `data/gold/` |
+| Camada | Responsabilidade | Destino |
+|--------|-----------------|---------|
+| Bronze | Ficheiro bruto do cliente normalizado em DataFrame | memória |
+| Silver | DataFrame com métricas calculadas | memória |
+| Gold | Relatório PDF gerado com ReportLab | Cloudinary |
 
 ### Schema do ficheiro do cliente
 
@@ -317,7 +328,7 @@ O `META_PHONE_NUMBER_ID` está errado. Corre o comando de verificação de crede
 O `META_APP_SECRET` no `.env` não corresponde ao valor em App Settings → Basic no dashboard da Meta. Confirma que copiaste o valor correcto sem espaços.
 
 **`429 Too Many Requests`**
-O rate limiter bloqueou o IP. Normal em testes com muitos pedidos seguidos — aguarda 1 minuto.
+O rate limiter bloqueou o IP. Normal em testes com muitos pedidos seguidos aguarda 1 minuto.
 
 **`ImportError: Unable to find a usable engine` (pyarrow)**
 ```bash
@@ -334,6 +345,9 @@ Confirma que o `WEBHOOK_VERIFY_TOKEN` no `.env` é exactamente igual ao valor pr
 **Bot não responde após mensagem**
 Verifica se o campo `messages` está subscrito no dashboard da Meta em Configuration → Webhook fields.
 
+**PDF não chega ao cliente**
+Confirma que `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY` e `CLOUDINARY_API_SECRET` estão definidos nas variáveis de ambiente do Render. Verifica os logs do serviço para ver se o upload ao Cloudinary retornou erro.
+
 **Render OOM (memory limit exceeded)**
 O servidor reiniciou por falta de memória. O pipeline já usa `gc.collect()` e imports lazy do ReportLab para minimizar o consumo. Se persistir, considera upgrade para o plano Starter ($7/mês, 2GB RAM).
 
@@ -347,6 +361,7 @@ O servidor reiniciou por falta de memória. O pipeline já usa `gc.collect()` e 
 - A verificação de assinatura HMAC-SHA256 está implementada e activa em produção
 - Rate limiting activo no endpoint `/webhook` (20 pedidos/minuto por IP)
 - Ficheiros de upload temporários são apagados automaticamente após processamento
+- O envio de mensagens e PDFs tem retry automático (3 tentativas com backoff exponencial)
 
 ---
 
@@ -365,6 +380,7 @@ O servidor reiniciou por falta de memória. O pipeline já usa `gc.collect()` e 
 | Meta Cloud API (menos de 1.000 conversas) | $0.00 |
 | Render.com (free tier) | $0.00 |
 | PostgreSQL (free tier) | $0.00 |
+| Cloudinary (free tier, 25GB) | $0.00 |
 | Total | $0.00 |
 
 Com 10 clientes no plano Básico: $100/mês de receita com margem bruta de 100%.
