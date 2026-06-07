@@ -258,6 +258,13 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
 
     if not cliente:
         criar_cliente(numero_limpo)
+        cliente = carregar_cliente(numero_limpo)
+
+    if not cliente:
+        print(f"Erro crítico: não foi possível criar/carregar cliente {numero_limpo}")
+        return
+
+    if cliente["onboarding_passo"] == 1 and not cliente.get("nome"):
         enviar_mensagem(numero_limpo, "Bem-vindo ao InsightZone! Qual e o nome do teu negocio?")
         return
 
