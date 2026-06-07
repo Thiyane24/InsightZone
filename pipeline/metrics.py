@@ -4,6 +4,7 @@ from datetime import datetime
 
 
 def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> dict:
+
     # 1. NORMALIZAÇÃO DE COLUNAS
     df.columns = [col.lower().strip() for col in df.columns]
 
@@ -17,16 +18,25 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     if not col_total and col_qtd:
         col_preco = next((c for c in df.columns if 'prec' in c or 'price' in c), None)
         if col_preco:
-            df['total_calculado'] = pd.to_numeric(df[col_preco], errors='coerce').fillna(0) \
-                                  * pd.to_numeric(df[col_qtd],   errors='coerce').fillna(0)
+            df['total_calculado'] = (
+                pd.to_numeric(df[col_preco], errors='coerce').fillna(0)
+                * pd.to_numeric(df[col_qtd], errors='coerce').fillna(0)
+            )
             col_total = 'total_calculado'
 
     # 4. PARSING DE DATAS
+    #  criar coluna de fallback antes de tentar usá-la
     if col_data:
         df[col_data] = pd.to_datetime(df[col_data], errors='coerce')
         df = df.dropna(subset=[col_data])
-    else:
-        df['data_fallback'] = pd.to_datetime(datetime.now().date())
+        # Se ficou vazio depois do dropna, usa fallback
+        if df.empty:
+            df = df.copy()
+            col_data = None
+
+    if not col_data:
+        df = df.copy()
+        df['data_fallback'] = pd.Timestamp(datetime.now().date())
         col_data = 'data_fallback'
 
     # 5. TIPOS NUMÉRICOS
@@ -43,54 +53,52 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
         col_qtd = 'qtd_um'
 
     # 6. KPIs CORE
-    total_faturado  = float(df[col_total].sum())
-    col_id          = next((c for c in df.columns if 'id' in c or 'fatura' in c or 'recibo' in c), None)
+    total_faturado   = float(df[col_total].sum())
+    col_id           = next((c for c in df.columns if c in ('id', 'fatura', 'recibo', 'order_id', 'invoice')), None)
     total_transacoes = int(df[col_id].nunique()) if col_id else int(len(df))
 
     vendas_por_dia = df.groupby(df[col_data].dt.date)[col_total].sum()
-    melhor_dia_str = vendas_por_dia.idxmax().strftime('%Y-%m-%d') \
-        if not vendas_por_dia.empty else datetime.now().strftime('%Y-%m-%d')
+    melhor_dia_str = (
+        vendas_por_dia.idxmax().strftime('%Y-%m-%d')
+        if not vendas_por_dia.empty
+        else datetime.now().strftime('%Y-%m-%d')
+    )
 
-    # Converte para dict Python nativo ANTES de libertar o DataFrame
+    # 7. TOP PRODUTOS converter para tipos Python nativos antes de libertar o df
     if col_produto:
         top_produtos_dict = (
             df.groupby(col_produto)[col_qtd]
               .sum()
               .sort_values(ascending=False)
               .head(5)
-              .to_dict()           
+              .to_dict()
         )
-        # Garante que chaves e valores são tipos Python base 
         top_produtos_dict = {str(k): int(v) for k, v in top_produtos_dict.items()}
     else:
         top_produtos_dict = {"Nenhum produto detetado": 0}
 
-    # 7. MÉTRICAS AVANÇADAS
-    mes_nome    = datetime.now().strftime('%B')
+    # 8. MÉTRICAS AVANÇADAS
+    mes_nome     = datetime.now().strftime('%B')
     ticket_medio = total_faturado / total_transacoes if total_transacoes > 0 else 0.0
 
-    # 8. LIBERTAÇÃO EXPLÍCITA DA MEMÓRIA
-    # O DataFrame pode ocupar dezenas de MB libertar aqui evita que o processo
-    # acumule memória ao longo de múltiplos pedidos concorrentes no Render free tier.
+    # 9. LIBERTAÇÃO EXPLÍCITA DA MEMÓRIA
     del df
     gc.collect()
 
-    metricas = {
-        "total":              total_faturado,
-        "total_transacoes":   total_transacoes,
-        "ticket_medio":       ticket_medio,
-        "melhor_dia":         melhor_dia_str,
-        "top_produtos":       top_produtos_dict,
+    return {
+        "total":               total_faturado,
+        "total_transacoes":    total_transacoes,
+        "ticket_medio":        ticket_medio,
+        "melhor_dia":          melhor_dia_str,
+        "top_produtos":        top_produtos_dict,
 
-        # Aliases mensais (mantidos para compatibilidade com report.py)
-        "total_mensal":       total_faturado,
-        "transacoes_mensal":  total_transacoes,
+        # Aliases mensais (compatibilidade com report.py)
+        "total_mensal":        total_faturado,
+        "transacoes_mensal":   total_transacoes,
         "ticket_medio_mensal": ticket_medio,
-        "melhor_dia_mes":     melhor_dia_str,
-        "top_produtos_mes":   top_produtos_dict,
-        "mes_nome":           mes_nome,
+        "melhor_dia_mes":      melhor_dia_str,
+        "top_produtos_mes":    top_produtos_dict,
+        "mes_nome":            mes_nome,
 
         "variacao_pct": None,
     }
-
-    return metricas

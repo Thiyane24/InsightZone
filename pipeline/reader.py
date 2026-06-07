@@ -18,9 +18,9 @@ MAPA_HEURISTICA = {
         "amount", "count", "volume", "num", "numero"
     ],
     "valor": [
-        "valor", "value", "total", "preco", "price", "revenue", "receita",
-        "vendas", "sales", "montante", "subtotal", "gross", "net",
-        "total_venda", "total venda", "sale value", "venda"
+    "valor", "value", "total", "preco", "price", "revenue", "receita",
+    "montante", "subtotal", "gross", "net",
+    "total_venda", "total venda", "sale value",   "faturacao", "faturacao_total", "faturacao total"
     ],
 }
 

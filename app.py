@@ -5,7 +5,7 @@ import json
 import os
 import uuid
 from datetime import datetime
-from pipeline.storage import upload_pdf
+
 import httpx
 import psycopg2
 from dotenv import load_dotenv
@@ -19,8 +19,13 @@ from pipeline.metrics import calcular_metricas
 from pipeline.reader import ingest
 from pipeline.report import gerar_relatorio
 from pipeline.sender import enviar_mensagem, main_function
+from pipeline.storage import upload_pdf
 
 load_dotenv()
+
+# Deduplicação de mensagens — evita processar o mesmo webhook duas vezes
+# (o Meta faz retry automático se não recebe 200 a tempo)
+_mensagens_vistas: set = set()
 
 MENU = """Ola! Sou o InsightZone.
 Modo atual: {frequencia}
@@ -44,7 +49,10 @@ def verificar_assinatura_meta(payload_bytes: bytes, signature_header: str) -> bo
     if not secret:
         print("Aviso: META_APP_SECRET não configurado no .env")
         return False
-    expected = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
+    # BUG CORRIGIDO: hmac.new() não existe em Python — usar hmac.new é alias de hmac.HMAC
+    # A forma correcta é hmac.new(key, msg, digestmod)
+    mac = hmac.new(secret.encode(), payload_bytes, hashlib.sha256)
+    expected = mac.hexdigest()
     return hmac.compare_digest(f"sha256={expected}", signature_header)
 
 
@@ -67,20 +75,24 @@ def carregar_cliente(phone_number: str) -> dict | None:
     try:
         conn   = get_conn()
         cursor = conn.cursor()
-        cursor.execute("SELECT numero, nome, negocio, frequencia, ultimo_ficheiro, onboarding_passo, historico FROM clientes WHERE numero = %s", (numero_limpo,))
+        cursor.execute(
+            "SELECT numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico "
+            "FROM clientes WHERE numero = %s",
+            (numero_limpo,)
+        )
         row = cursor.fetchone()
         cursor.close()
         conn.close()
         if not row:
             return None
         return {
-            "numero":           row[0],
-            "nome":             row[1],
-            "negocio":          row[2],
-            "frequencia":       row[3] or "semanal",
-            "ultimo_ficheiro":  row[4],
-            "onboarding_passo": row[5],
-            "historico":        json.loads(row[6]) if row[6] else [],
+            "numero":              row[0],
+            "nome":                row[1],
+            "negocio":             row[2],
+            "frequencia":          row[3] or "semanal",
+            "ultimo_relatorio_url": row[4],   # URL do Cloudinary, não path local
+            "onboarding_passo":    row[5],
+            "historico":           json.loads(row[6]) if row[6] else [],
         }
     except Exception as e:
         print(f"Erro ao carregar cliente: {e}")
@@ -93,7 +105,7 @@ def criar_cliente(numero_limpo: str):
         conn   = get_conn()
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO clientes (numero, nome, negocio, frequencia, ultimo_ficheiro, onboarding_passo, historico)
+            INSERT INTO clientes (numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico)
             VALUES (%s, NULL, NULL, 'semanal', NULL, 1, '[]')
             ON CONFLICT (numero) DO NOTHING
         """, (numero_limpo,))
@@ -105,10 +117,7 @@ def criar_cliente(numero_limpo: str):
 
 
 def actualizar_cliente(numero_limpo: str, campos: dict):
-    """
-    Actualiza campos específicos de um cliente.
-    Exemplo: actualizar_cliente(numero, {"nome": "Mercado X", "onboarding_passo": 2})
-    """
+    """Actualiza campos específicos de um cliente."""
     if not campos:
         return
     try:
@@ -129,19 +138,22 @@ def carregar_todos_clientes() -> list:
     try:
         conn   = get_conn()
         cursor = conn.cursor()
-        cursor.execute("SELECT numero, nome, negocio, frequencia, ultimo_ficheiro, onboarding_passo, historico FROM clientes")
+        cursor.execute(
+            "SELECT numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico "
+            "FROM clientes"
+        )
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
         return [
             {
-                "numero":           r[0],
-                "nome":             r[1],
-                "negocio":          r[2],
-                "frequencia":       r[3] or "semanal",
-                "ultimo_ficheiro":  r[4],
-                "onboarding_passo": r[5],
-                "historico":        json.loads(r[6]) if r[6] else [],
+                "numero":              r[0],
+                "nome":                r[1],
+                "negocio":             r[2],
+                "frequencia":          r[3] or "semanal",
+                "ultimo_relatorio_url": r[4],
+                "onboarding_passo":    r[5],
+                "historico":           json.loads(r[6]) if r[6] else [],
             }
             for r in rows
         ]
@@ -157,8 +169,13 @@ def tratar_onboarding(phone_number: str, texto: str, cliente: dict):
     numero_limpo = limpar_numero(phone_number)
 
     if passo == 1:
-        actualizar_cliente(numero_limpo, {"nome": texto, "onboarding_passo": 2})
-        enviar_mensagem(numero_limpo, "Que tipo de negocio tens?\n1. Servicos\n2. Retalho (Alimentar, Vestuário, Eletrónica)\n3. Agropecuaria\n4. Outro")
+        # BUG CORRIGIDO: guardar o nome E avançar o passo numa só operação
+        nome = texto.strip()
+        if not nome:
+            enviar_mensagem(numero_limpo, "Por favor envia o nome do teu negocio.")
+            return
+        actualizar_cliente(numero_limpo, {"nome": nome, "onboarding_passo": 2})
+        enviar_mensagem(numero_limpo, "Que tipo de negocio tens?\n1. Servicos\n2. Retalho (Alimentar, Vestuario, Electronica)\n3. Agropecuaria\n4. Outro")
 
     elif passo == 2:
         tipos   = {"1": "servicos", "2": "retalho", "3": "agropecuaria", "4": "outro"}
@@ -170,24 +187,32 @@ def tratar_onboarding(phone_number: str, texto: str, cliente: dict):
         freq_map   = {"1": "semanal", "2": "mensal"}
         frequencia = freq_map.get(texto.strip(), "semanal")
         actualizar_cliente(numero_limpo, {"frequencia": frequencia, "onboarding_passo": 0})
-        enviar_mensagem(numero_limpo, f"Perfeito! Onboarding completo. Configurado para envio {frequencia}.\nEnvia agora o teu ficheiro CSV, Excel ou PDF com os teus dados de vendas.")
+        enviar_mensagem(
+            numero_limpo,
+            f"Perfeito! Onboarding completo. Configurado para envio {frequencia}.\n"
+            "Envia agora o teu ficheiro CSV, Excel ou PDF com os teus dados de vendas."
+        )
 
 
 # ── BACKGROUND TASKS ──────────────────────────────────────────────────────────
 
-def gerar_relatorio_background(phone_number: str, filepath: str, nome_cliente: str, frequencia_atual: str):
+def gerar_relatorio_background(phone_number: str, pdf_url: str, nome_cliente: str, frequencia_atual: str):
+    """
+    BUG CORRIGIDO: já não tenta re-processar ficheiro local (que foi apagado).
+    Reenvia o último PDF guardado no Cloudinary directamente.
+    """
     try:
-        numero_limpo       = limpar_numero(phone_number)
-        df                 = ingest(filepath)
-        metricas           = calcular_metricas(df, frequencia_cliente=frequencia_atual)
-        timestamp_label    = datetime.now().strftime('%Y%m%d_%H%M%S')
-        hash_unico         = uuid.uuid4().hex[:6]
-        pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
-        pdf_path           = gerar_relatorio(metricas, nome_negocio=nome_cliente, semana_label=pdf_filename_limpo)
-        pdf_url            = upload_pdf(pdf_path)
-        main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=f"Aqui tens o teu relatório {frequencia_atual} atualizado:")
+        numero_limpo = limpar_numero(phone_number)
+        if not pdf_url:
+            enviar_mensagem(numero_limpo, "Ainda nao tens nenhum relatorio. Envia um ficheiro CSV, Excel ou PDF para comecar.")
+            return
+        pdf_filename = pdf_url.split("/")[-1]
+        main_function(
+            numero_limpo, pdf_url, pdf_filename,
+            mensagem=f"Aqui tens o teu relatorio {frequencia_atual} mais recente:"
+        )
     except Exception as e:
-        print(f"Erro ao gerar relatório em background: {e}")
+        print(f"Erro ao reenviar relatorio: {e}")
 
 
 def processar_ficheiro(phone_number: str, document_id: str, filename: str):
@@ -197,14 +222,15 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
         numero_limpo = limpar_numero(phone_number)
 
         meta_url     = f"https://graph.facebook.com/v25.0/{document_id}"
-        r            = httpx.get(meta_url, headers={"Authorization": f"Bearer {token}"})
+        r            = httpx.get(meta_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
         download_url = r.json().get("url")
 
         if not download_url:
-            print(f"Erro: URL de download não obtida. Resposta: {r.text}")
+            print(f"Erro: URL de download nao obtida. Resposta: {r.text}")
+            enviar_mensagem(numero_limpo, "Nao consegui descarregar o ficheiro. Tenta novamente.")
             return
 
-        ficheiro = httpx.get(download_url, headers={"Authorization": f"Bearer {token}"})
+        ficheiro = httpx.get(download_url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
         os.makedirs("data/uploads", exist_ok=True)
 
         timestamp_upload = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
@@ -229,23 +255,58 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
         pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
 
         pdf_path = gerar_relatorio(metricas, nome_negocio=nome_empresa, semana_label=pdf_filename_limpo)
-        pdf_url  = upload_pdf(pdf_path)
 
-        main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=f"O teu relatório {frequencia} está pronto:")
+        # storage.py faz upload E apaga o ficheiro pdf local — não apagar aqui também
+        pdf_url = upload_pdf(pdf_path)
 
-        actualizar_cliente(numero_limpo, {"ultimo_ficheiro": filepath})
-        print("Pipeline concluído com sucesso!")
+        # BUG CORRIGIDO: guardar o URL do Cloudinary, não o path local do ficheiro de vendas
+        actualizar_cliente(numero_limpo, {"ultimo_relatorio_url": pdf_url})
+
+        main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=f"O teu relatorio {frequencia} esta pronto:")
+        print("Pipeline concluido com sucesso!")
 
     except Exception as e:
         print(f"Erro ao processar ficheiro em background: {e}")
+        try:
+            numero_limpo = limpar_numero(phone_number)
+            enviar_mensagem(numero_limpo, "Ocorreu um erro ao processar o ficheiro. Verifica se o formato e valido (CSV, Excel ou PDF).")
+        except Exception:
+            pass
 
     finally:
+        # Apaga apenas o ficheiro de vendas temporário (o PDF é apagado pelo storage.py)
         if filepath and os.path.exists(filepath):
             try:
                 os.remove(filepath)
-                print(f"Ficheiro temporário removido: {filepath}")
+                print(f"Ficheiro temporario removido: {filepath}")
             except Exception as cleanup_err:
-                print(f"Aviso: não foi possível remover {filepath}: {cleanup_err}")
+                print(f"Aviso: nao foi possivel remover {filepath}: {cleanup_err}")
+
+
+# ── RESUMO E TOP (background) ─────────────────────────────────────────────────
+
+def _resumo_background(numero_limpo: str, pdf_url: str, frequencia_atual: str):
+    """
+    BUG CORRIGIDO: resumo rápido baseado no último PDF URL (não num ficheiro local apagado).
+    Envia o URL do último relatório com uma mensagem de resumo contextual.
+    """
+    try:
+        if not pdf_url:
+            enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
+            return
+        # Envia o último relatório guardado como "resumo rápido"
+        pdf_filename = pdf_url.split("/")[-1]
+        main_function(
+            numero_limpo, pdf_url, pdf_filename,
+            mensagem=f"Aqui tens o teu ultimo relatorio {frequencia_atual}:"
+        )
+    except Exception as e:
+        print(f"Erro ao enviar resumo: {e}")
+
+
+def _top_background(numero_limpo: str, pdf_url: str, frequencia_atual: str):
+    """Reenvia o último relatório como resposta ao comando 'top'."""
+    _resumo_background(numero_limpo, pdf_url, frequencia_atual)
 
 
 # ── MOTOR DE COMANDOS ─────────────────────────────────────────────────────────
@@ -261,87 +322,61 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         cliente = carregar_cliente(numero_limpo)
 
     if not cliente:
-        print(f"Erro crítico: não foi possível criar/carregar cliente {numero_limpo}")
+        print(f"Erro critico: nao foi possivel criar/carregar cliente {numero_limpo}")
         return
 
+    # Passo 1: sem nome ainda
+    # - saudação → envia boas-vindas e aguarda próxima mensagem com o nome
+    # - qualquer outro texto → já é o nome, processa directamente
     if cliente["onboarding_passo"] == 1 and not cliente.get("nome"):
-        enviar_mensagem(numero_limpo, "Bem-vindo ao InsightZone! Qual e o nome do teu negocio?")
+        saudacoes = {"ola", "olá", "oi", "hello", "hi", "bom dia", "boa tarde", "boa noite", "novo"}
+        if texto in saudacoes or len(texto.strip()) <= 2:
+            enviar_mensagem(numero_limpo, "Bem-vindo ao InsightZone! Qual e o nome do teu negocio?")
+            return
+        tratar_onboarding(numero_limpo, texto_original, cliente)
         return
 
     if cliente["onboarding_passo"] > 0:
         tratar_onboarding(numero_limpo, texto_original, cliente)
         return
 
-    frequencia_atual = cliente.get("frequencia", "semanal")
+    frequencia_atual    = cliente.get("frequencia", "semanal")
+    ultimo_relatorio_url = cliente.get("ultimo_relatorio_url")
 
     if texto in ["ola", "olá", "oi", "hello", "hi", "bom dia", "boa tarde", "boa noite"]:
         enviar_mensagem(numero_limpo, MENU.format(frequencia=frequencia_atual.upper()))
         return
 
     if texto in ["relatorio", "relatório", "2"]:
-        if not cliente.get("ultimo_ficheiro"):
+        if not ultimo_relatorio_url:
             enviar_mensagem(numero_limpo, "Ainda nao tens nenhum relatorio. Envia um ficheiro CSV, Excel ou PDF para comecar.")
             return
-        enviar_mensagem(numero_limpo, "A preparar o teu documento estratégico. Aguarda um momento...")
+        enviar_mensagem(numero_limpo, "A preparar o teu documento estrategico. Aguarda um momento...")
         background_tasks.add_task(
             gerar_relatorio_background,
-            numero_limpo, cliente["ultimo_ficheiro"], cliente["nome"], frequencia_atual
+            numero_limpo, ultimo_relatorio_url, cliente["nome"], frequencia_atual
         )
         return
 
     if texto in ["resumo", "rapido", "rápido", "3"]:
-        if not cliente.get("ultimo_ficheiro"):
+        if not ultimo_relatorio_url:
             enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
             return
         background_tasks.add_task(
-            _resumo_background, numero_limpo, cliente["ultimo_ficheiro"], frequencia_atual
+            _resumo_background, numero_limpo, ultimo_relatorio_url, frequencia_atual
         )
         return
 
     if texto in ["top", "top cinco", "top 5", "4"]:
-        if not cliente.get("ultimo_ficheiro"):
+        if not ultimo_relatorio_url:
             enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
             return
         background_tasks.add_task(
-            _top_background, numero_limpo, cliente["ultimo_ficheiro"], frequencia_atual
+            _top_background, numero_limpo, ultimo_relatorio_url, frequencia_atual
         )
         return
 
     enviar_mensagem(numero_limpo, AJUDA)
-
-
-def _resumo_background(numero_limpo: str, ultimo_ficheiro: str, frequencia_atual: str):
-    try:
-        df       = ingest(ultimo_ficheiro)
-        metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
-        if frequencia_atual == "mensal":
-            resumo = (
-                f"Resumo do Mes ({metricas['mes_nome']}):\n"
-                f"Total de vendas: {metricas['total_mensal']:.2f}\n"
-                f"Total de transacoes: {metricas['transacoes_mensal']}\n"
-                f"Melhor dia: {metricas['melhor_dia_mes']}"
-            )
-        else:
-            resumo = (
-                f"Resumo da semana:\n"
-                f"Total de vendas: {metricas['total']:.2f}\n"
-                f"Total de transacoes: {metricas['total_transacoes']}\n"
-                f"Melhor dia: {metricas['melhor_dia']}"
-            )
-        enviar_mensagem(numero_limpo, resumo)
-    except Exception as e:
-        print(f"Erro ao gerar resumo: {e}")
-
-
-def _top_background(numero_limpo: str, ultimo_ficheiro: str, frequencia_atual: str):
-    try:
-        df       = ingest(ultimo_ficheiro)
-        metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
-        top      = metricas["top_produtos_mes"] if frequencia_atual == "mensal" else metricas["top_produtos"]
-        linhas   = [f"{i+1}. {produto} — {int(qty)} unidades" for i, (produto, qty) in enumerate(top.items())]
-        enviar_mensagem(numero_limpo, f"Top 5 produtos ({frequencia_atual}):\n" + "\n".join(linhas))
-    except Exception as e:
-        print(f"Erro ao gerar top produtos: {e}")
 
 
 # ── FASTAPI ───────────────────────────────────────────────────────────────────
@@ -371,7 +406,7 @@ def verificar_webhook(
 ):
     if hub_mode == "subscribe" and hub_verify_token == os.getenv("WEBHOOK_VERIFY_TOKEN"):
         return Response(content=str(hub_challenge), media_type="text/plain")
-    raise HTTPException(status_code=403, detail="Token inválido")
+    raise HTTPException(status_code=403, detail="Token invalido")
 
 
 @app.post("/webhook")
@@ -381,7 +416,7 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
 
     signature = request.headers.get("X-Hub-Signature-256", "")
     if not verificar_assinatura_meta(body, signature):
-        raise HTTPException(status_code=403, detail="Assinatura inválida")
+        raise HTTPException(status_code=403, detail="Assinatura invalida")
 
     try:
         payload = json.loads(body)
@@ -389,9 +424,9 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
         return Response(content="OK", status_code=200)
 
     try:
-        entry        = payload.get("entry", [])[0]
-        changes      = entry.get("changes", [])[0]
-        value        = changes.get("value", {})
+        entry    = payload.get("entry", [])[0]
+        changes  = entry.get("changes", [])[0]
+        value    = changes.get("value", {})
 
         if "messages" not in value:
             return Response(content="OK", status_code=200)
@@ -399,9 +434,18 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
         mensagem     = value["messages"][0]
         phone_number = limpar_numero(mensagem.get("from"))
         tipo         = mensagem.get("type")
+        message_id   = mensagem.get("id", "")
 
     except (KeyError, IndexError, TypeError):
         return Response(content="OK", status_code=200)
+
+    # Ignora mensagens já processadas
+    if message_id and message_id in _mensagens_vistas:
+        return Response(content="OK", status_code=200)
+    if message_id:
+        _mensagens_vistas.add(message_id)
+        if len(_mensagens_vistas) > 1000:
+            _mensagens_vistas.clear()
 
     if tipo == "text":
         texto = mensagem.get("text", {}).get("body", "")
@@ -409,8 +453,15 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
 
     elif tipo == "document":
         cliente = carregar_cliente(phone_number)
+
+        # se ainda em onboarding, tratar como texto "documento" não "novo"
         if not cliente or cliente.get("onboarding_passo", 0) > 0:
-            tratar_comando(phone_number, "novo", background_tasks)
+            enviar_mensagem(
+                limpar_numero(phone_number),
+                "Por favor completa o registo primeiro. Qual e o nome do teu negocio?"
+            )
+            if not cliente:
+                criar_cliente(limpar_numero(phone_number))
             return Response(content="OK", status_code=200)
 
         doc_data    = mensagem.get("document", {})
