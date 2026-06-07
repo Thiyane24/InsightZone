@@ -44,9 +44,9 @@ Meta Cloud API
     v
 FastAPI (app.py)
     |
-    |__ pipeline/reader.py      lê o ficheiro, devolve DataFrame
-    |__ pipeline/metrics.py     calcula métricas, guarda parquet
-    |__ pipeline/report.py      gera PDF com ReportLab
+    |__ pipeline/reader.py      lê o ficheiro, normaliza colunas, devolve DataFrame
+    |__ pipeline/metrics.py     calcula métricas, liberta DataFrame com gc.collect()
+    |__ pipeline/report.py      gera PDF com ReportLab (imports lazy)
     |__ pipeline/sender.py      envia PDF via Meta Cloud API
     |
     | PDF gerado em data/gold/
@@ -57,7 +57,7 @@ Cliente recebe PDF no WhatsApp
 
 O FastAPI responde imediatamente com `200 OK` à Meta e processa o ficheiro em background via `BackgroundTasks`, evitando timeouts no webhook.
 
-O APScheduler corre dentro do FastAPI e envia relatórios automaticamente de forma semanal e mensal para todos os clientes registados.
+O APScheduler corre dentro do FastAPI e envia relatórios automaticamente de forma semanal ou mensal para todos os clientes registados.
 
 ---
 
@@ -108,7 +108,13 @@ DATABASE_URL=postgresql://user:password@host:5432/insightzone_db
 2. Cria uma app com o use case "Connect with customers through WhatsApp"
 3. Em **API Setup**, gera um access token temporário (válido 24 horas para testes)
 4. Para produção, cria um token permanente através do System User no Business Manager
-5. Copia o Phone Number ID e o WhatsApp Business Account ID da mesma página
+5. Copia o **Phone Number ID** e o **WhatsApp Business Account ID** da mesma página
+6. Em **App Settings → Basic**, copia o **App Secret** para a variável `META_APP_SECRET`
+
+> **Atenção:** O Phone Number ID e o WhatsApp Business Account ID são valores distintos. Confirma os valores correctos correndo este comando após configurar o `.env`:
+> ```bash
+> python -c "import httpx, os; from dotenv import load_dotenv; load_dotenv(); r = httpx.get('https://graph.facebook.com/v15.0/' + os.getenv('META_WABA_ID') + '/phone_numbers', headers={'Authorization': 'Bearer ' + os.getenv('META_ACCESS_TOKEN')}); print(r.json())"
+> ```
 
 ### Configurar o webhook
 
@@ -125,26 +131,24 @@ DATABASE_URL=postgresql://user:password@host:5432/insightzone_db
 insightzone/
 |
 |__ app.py                  ponto de entrada FastAPI, webhook, comandos, onboarding
-|__ scheduler.py            APScheduler, envio automático semanal e mensal
-|__ clientes.json           base de dados de clientes (número, negócio, histórico)
+|__ scheduler.py            APScheduler, envio automático semanal/mensal
+|__ criar_tabela.py         script único para criar a tabela na base de dados
 |__ requirements.txt        dependências Python com versões fixas
 |__ .env                    credenciais (nunca commitar)
 |__ .gitignore
 |
 |__ pipeline/
 |   |__ __init__.py
-|   |__ reader.py           leitura de CSV, Excel e PDF
-|   |__ metrics.py          cálculo de métricas de vendas
-|   |__ report.py           geração do relatório PDF com ReportLab
+|   |__ reader.py           leitura de CSV, Excel e PDF com normalização automática de colunas
+|   |__ metrics.py          cálculo de métricas de vendas, libertação de memória com gc
+|   |__ report.py           geração do relatório PDF com ReportLab (imports lazy)
 |   |__ sender.py           envio de mensagens e PDFs via Meta API
 |
 |__ data/
 |   |__ bronze/             ficheiros brutos após ingestão (parquet)
 |   |__ silver/             dados processados após cálculo de métricas (parquet)
 |   |__ gold/               PDFs gerados, servidos publicamente em /reports/
-|   |__ uploads/            ficheiros temporários enviados pelos clientes
-|
-|__ static/                 assets estáticos
+|   |__ uploads/            ficheiros temporários — apagados automaticamente após processamento
 ```
 
 ---
@@ -159,7 +163,9 @@ O pipeline segue a arquitectura medalhão (bronze, silver, gold):
 | Silver | DataFrame com métricas calculadas em parquet | `data/silver/` |
 | Gold | Relatório PDF pronto para entrega | `data/gold/` |
 
-### Schema mínimo do ficheiro do cliente
+### Schema do ficheiro do cliente
+
+O bot identifica automaticamente as colunas do ficheiro enviado pelo cliente usando heurística — não é necessário seguir um formato exacto. O schema abaixo é o formato recomendado para melhores resultados:
 
 | Coluna | Tipo | Exemplo |
 |--------|------|---------|
@@ -193,13 +199,72 @@ Colunas com nomes alternativos como `Date`, `Item`, `Qty`, `Total`, `Price`, `De
 
 ### Onboarding
 
-Quando um número novo envia a primeira mensagem (texto ou ficheiro), o bot inicia um fluxo de onboarding de três passos antes de aceitar ficheiros:
+Quando um número novo envia a primeira mensagem, o bot inicia um fluxo de onboarding de três passos antes de aceitar ficheiros:
 
 1. Nome do negócio
 2. Tipo de negócio (Serviços, Retalho, Agropecuária, Outro)
-3. Email de backup (opcional)
+3. Cadência de relatórios (Semanal ou Mensal)
 
-O estado do onboarding é persistido em `clientes.json` através do campo `onboarding_passo`.
+O estado do onboarding é persistido na base de dados PostgreSQL através do campo `onboarding_passo`.
+
+---
+
+## Segurança
+
+### Rate Limiting
+
+O endpoint `/webhook` está protegido com `slowapi` — máximo de 20 pedidos por minuto por IP. Pedidos acima desse limite recebem `429 Too Many Requests` automaticamente.
+
+```python
+@app.post("/webhook")
+@limiter.limit("20/minute")
+async def receber_webhook(request: Request, ...):
+```
+
+### Verificação de Assinatura SHA-256
+
+Cada pedido da Meta vem assinado com o `APP_SECRET` no header `X-Hub-Signature-256`. O InsightZone verifica esta assinatura antes de processar qualquer mensagem — pedidos sem assinatura válida recebem `403 Assinatura inválida`.
+
+```python
+def verificar_assinatura_meta(payload_bytes: bytes, signature_header: str) -> bool:
+    expected = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature_header)
+```
+
+O `META_APP_SECRET` encontra-se em **App Settings → Basic → App Secret** no dashboard da Meta.
+
+---
+
+## Base de Dados
+
+O InsightZone usa **PostgreSQL** para persistência de clientes em vez de ficheiros JSON locais.
+
+### Criar a tabela
+
+Após configurar o `DATABASE_URL` no `.env`, corre uma única vez:
+
+```bash
+python criar_tabela.py
+```
+
+### Schema da tabela `clientes`
+
+| Coluna | Tipo | Descrição |
+|--------|------|-----------|
+| numero | TEXT (PK) | Número WhatsApp do cliente |
+| nome | TEXT | Nome do negócio |
+| negocio | TEXT | Tipo de negócio |
+| frequencia | TEXT | `semanal` ou `mensal` |
+| ultimo_ficheiro | TEXT | Caminho do último ficheiro processado |
+| onboarding_passo | INTEGER | Passo actual do onboarding (0 = completo) |
+| historico | TEXT | JSON com histórico de parquets |
+| criado_em | TIMESTAMP | Data de registo |
+
+### Criar a base de dados no Render
+
+1. No dashboard do Render clica em **New + → PostgreSQL**
+2. Nome: `insightzone-db`, Region: `Frankfurt (EU Central)`, Plan: `Free`
+3. Copia o **Internal Database URL** e adiciona ao `.env` como `DATABASE_URL`
 
 ---
 
@@ -238,6 +303,51 @@ Define as variáveis de ambiente no dashboard do Railway e actualiza o `BASE_URL
 ### Variáveis de ambiente em produção
 
 Todas as variáveis do `.env` devem ser configuradas no painel de variáveis de ambiente da plataforma de hosting. Nunca incluir o ficheiro `.env` no repositório.
+
+---
+
+## Troubleshooting
+
+**`401 Session has expired`**
+O token da Meta expirou. Vai a developers.facebook.com → InsightZone → API Setup e gera um novo token. Substitui no `.env` e reinicia o servidor.
+
+**`Object with ID '...' does not exist`**
+O `META_PHONE_NUMBER_ID` está errado. Corre o comando de verificação de credenciais acima para obter o ID correcto associado ao teu WABA.
+
+**`403 Assinatura inválida`**
+O `META_APP_SECRET` no `.env` não corresponde ao valor em App Settings → Basic no dashboard da Meta. Confirma que copiaste o valor correcto sem espaços.
+
+**`429 Too Many Requests`**
+O rate limiter bloqueou o IP. Normal em testes com muitos pedidos seguidos — aguarda 1 minuto.
+
+**`ImportError: Unable to find a usable engine` (pyarrow)**
+```bash
+pip install setuptools
+pip install pyarrow
+```
+
+**`ValueError: Colunas em falta`**
+O ficheiro enviado não tem colunas reconhecíveis. Verifica o output do terminal para ver o mapeamento tentado e adiciona as palavras-chave ao `MAPA_HEURISTICA` em `reader.py`.
+
+**Webhook não verifica (`403 Token inválido`)**
+Confirma que o `WEBHOOK_VERIFY_TOKEN` no `.env` é exactamente igual ao valor preenchido no campo "Verify Token" no dashboard da Meta.
+
+**Bot não responde após mensagem**
+Verifica se o campo `messages` está subscrito no dashboard da Meta em Configuration → Webhook fields.
+
+**Render OOM (memory limit exceeded)**
+O servidor reiniciou por falta de memória. O pipeline já usa `gc.collect()` e imports lazy do ReportLab para minimizar o consumo. Se persistir, considera upgrade para o plano Starter ($7/mês, 2GB RAM).
+
+---
+
+## Considerações de Segurança
+
+- O ficheiro `.env` está incluído no `.gitignore` e nunca deve ser commitado
+- O token de acesso da Meta deve ser rotacionado regularmente
+- O `WEBHOOK_VERIFY_TOKEN` deve ser uma string aleatória e difícil de adivinhar
+- A verificação de assinatura HMAC-SHA256 está implementada e activa em produção
+- Rate limiting activo no endpoint `/webhook` (20 pedidos/minuto por IP)
+- Ficheiros de upload temporários são apagados automaticamente após processamento
 
 ---
 
