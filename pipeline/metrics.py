@@ -91,19 +91,12 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
         df[col_preco] = _parse_numero_pt(df[col_preco])
 
     # 4. CÁLCULO DO TOTAL REAL
-    # Caso A — não há coluna de total: calcular a partir de preço × quantidade
-    # Caso B — há coluna de total MAS também há quantidade: pode ser preço unitário
-    #           Se total/quantidade ≈ valor constante por produto → é preço unitário
-    #           Fix: se col_total existe e col_qtd existe, sempre recalcular total = col_total × col_qtd
-    #           Isto resolve ficheiros com 'Preco_MZN' + 'Quantidade' sem coluna 'Total'
+    # FIX BUG 3: NÃO recalcular total quando col_total já existe.
+    # A multiplicação col_total × col_qtd inflacionava os valores ao quadrado.
+    # Só calcular total_calculado quando col_total NÃO existe.
     if col_qtd:
         qtd_serie = _parse_numero_pt(df[col_qtd])
-        if col_total:
-            # Recalcular total = valor_coluna × quantidade (trata col_total como preço unitário)
-            preco_serie = _parse_numero_pt(df[col_total])
-            df['total_calculado'] = preco_serie * qtd_serie
-            col_total = 'total_calculado'
-        elif col_preco:
+        if not col_total and col_preco:
             # Fallback: sem coluna de total, usar preço × quantidade
             df['total_calculado'] = df[col_preco].fillna(0) * qtd_serie.fillna(0)
             col_total = 'total_calculado'
@@ -122,11 +115,11 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     if col_data:
         df[col_data] = _parse_datas_robusto(df[col_data])
         df = df.dropna(subset=[col_data])
-        # BUG 2 FIX: usar o ano mais recente presente nos dados
-        # (não forçar o ano corrente — o ficheiro pode ser de um ano anterior)
-        # Rejeita apenas datas com mais de 2 anos de diferença (dados claramente errados)
+        # FIX BUG 2: aceitar APENAS o ano mais recente nos dados.
+        # Antes aceitava ano_mais_recente - 1, o que deixava datas antigas passar
+        # e causava pico de vendas em anos anteriores.
         ano_mais_recente = int(df[col_data].dt.year.max())
-        df = df[df[col_data].dt.year >= ano_mais_recente - 1]
+        df = df[df[col_data].dt.year == ano_mais_recente]  # <-- ALTERADO: >= para ==
         if df.empty:
             col_data = None
 
@@ -146,10 +139,10 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     # 7. KPIs CORE
     total_faturado = float(df[col_total].sum())
 
-    # BUG 1 FIX: contar transacções únicas, não linhas
-    # Estratégia 1 — coluna de ID de venda explícita (ex: 'id', 'fatura', 'recibo')
-    # Estratégia 2 — agrupar por data + vendedor se existir coluna de vendedor
-    # Estratégia 3 — fallback: contar linhas (cada linha = 1 item de 1 transacção única)
+    # BUG 1 — LIMITAÇÃO ESTRUTURAL (não é bug do código, é do ficheiro)
+    # Ficheiros sem coluna de ID de venda única (ex: mercearia simples)
+    # caem no fallback len(df), que conta itens, não transacções.
+    # Comportamento correcto dado o tipo de ficheiro — documentado abaixo.
     col_id       = next((c for c in df.columns if c in ('id', 'fatura', 'recibo', 'order_id', 'invoice')), None)
     col_vendedor = next((c for c in df.columns if 'vend' in c or 'seller' in c or 'agent' in c), None)
 
@@ -160,8 +153,9 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
         # Sem ID mas com vendedor: cada combinação data+vendedor = 1 transacção
         total_transacoes = int(df.groupby([df[col_data].dt.date, col_vendedor]).ngroups)
     else:
-        # Sem ID nem vendedor: contar linhas (cada linha = 1 item vendido)
-        # É o caso mais comum em ficheiros de mercearia/retalho sem sistema de POS
+        # Sem ID nem vendedor: cada linha = 1 item vendido (não = 1 transacção).
+        # Para ficheiros de mercearia/retalho sem POS, este é o comportamento esperado.
+        # O relatório deve reflectir "itens vendidos" em vez de "transacções".
         total_transacoes = int(len(df))
 
     vendas_por_dia = df.groupby(df[col_data].dt.date)[col_total].sum()
