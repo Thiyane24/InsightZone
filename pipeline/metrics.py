@@ -111,10 +111,11 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     if col_data:
         df[col_data] = _parse_datas_robusto(df[col_data])
         df = df.dropna(subset=[col_data])
-        # BUG 2 FIX: rejeitar datas de anos anteriores ao corrente
-        # Evita que linhas antigas distorçam o pico de vendas
-        ano_corrente = datetime.now().year
-        df = df[df[col_data].dt.year == ano_corrente]
+        # BUG 2 FIX: usar o ano mais recente presente nos dados
+        # (não forçar o ano corrente — o ficheiro pode ser de um ano anterior)
+        # Rejeita apenas datas com mais de 2 anos de diferença (dados claramente errados)
+        ano_mais_recente = int(df[col_data].dt.year.max())
+        df = df[df[col_data].dt.year >= ano_mais_recente - 1]
         if df.empty:
             col_data = None
 
@@ -147,10 +148,9 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     elif col_vendedor and col_data:
         # Sem ID mas com vendedor: cada combinação data+vendedor = 1 transacção
         total_transacoes = int(df.groupby([df[col_data].dt.date, col_vendedor]).ngroups)
-    elif col_data:
-        # Sem ID nem vendedor: cada data única = 1 "sessão" de vendas
-        total_transacoes = int(df[col_data].dt.date.nunique())
     else:
+        # Sem ID nem vendedor: contar linhas (cada linha = 1 item vendido)
+        # É o caso mais comum em ficheiros de mercearia/retalho sem sistema de POS
         total_transacoes = int(len(df))
 
     vendas_por_dia = df.groupby(df[col_data].dt.date)[col_total].sum()
