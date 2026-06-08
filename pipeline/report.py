@@ -61,21 +61,21 @@ def _kpi_block(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: float):
     c = _cores()
 
     if is_mensal:
-        total     = metricas.get('total_mensal', 0)
-        trans     = metricas.get('transacoes_mensal', 1)
-        ticket    = metricas.get('ticket_medio_mensal', 0)
+        total      = metricas.get('total_mensal', 0)
+        trans      = metricas.get('transacoes_mensal', 1)
+        ticket     = metricas.get('ticket_medio_mensal', 0)
         melhor_dia = metricas.get('melhor_dia_mes', '—')
     else:
-        total     = metricas.get('total', 0)
-        trans     = metricas.get('total_transacoes', 1)
-        ticket    = metricas.get('ticket_medio', 0)
+        total      = metricas.get('total', 0)
+        trans      = metricas.get('total_transacoes', 1)
+        ticket     = metricas.get('ticket_medio', 0)
         melhor_dia = metricas.get('melhor_dia', '—')
 
     kpis = [
         ('FATURAÇÃO TOTAL', _fmt_mzn(total)),
-        ('TRANSAÇÕES',      str(trans)),
+        ('ITENS VENDIDOS',  str(trans)),        # ALTERADO: era 'TRANSAÇÕES'
         ('TICKET MÉDIO',    _fmt_mzn(ticket)),
-        ('PICO DE VENDAS',  str(melhor_dia)),
+        ('MELHOR DIA',  str(melhor_dia)),
     ]
 
     header_cells = [Paragraph(lbl, styles['kpi_lbl']) for lbl, _ in kpis]
