@@ -111,6 +111,10 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     if col_data:
         df[col_data] = _parse_datas_robusto(df[col_data])
         df = df.dropna(subset=[col_data])
+        # BUG 2 FIX: rejeitar datas de anos anteriores ao corrente
+        # Evita que linhas antigas distorçam o pico de vendas
+        ano_corrente = datetime.now().year
+        df = df[df[col_data].dt.year == ano_corrente]
         if df.empty:
             col_data = None
 
@@ -128,9 +132,26 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
         col_qtd = 'qtd_um'
 
     # 7. KPIs CORE
-    total_faturado   = float(df[col_total].sum())
-    col_id           = next((c for c in df.columns if c in ('id', 'fatura', 'recibo', 'order_id', 'invoice')), None)
-    total_transacoes = int(df[col_id].nunique()) if col_id else int(len(df))
+    total_faturado = float(df[col_total].sum())
+
+    # BUG 1 FIX: contar transacções únicas, não linhas
+    # Estratégia 1 — coluna de ID de venda explícita (ex: 'id', 'fatura', 'recibo')
+    # Estratégia 2 — agrupar por data + vendedor se existir coluna de vendedor
+    # Estratégia 3 — fallback: contar linhas (cada linha = 1 item de 1 transacção única)
+    col_id       = next((c for c in df.columns if c in ('id', 'fatura', 'recibo', 'order_id', 'invoice')), None)
+    col_vendedor = next((c for c in df.columns if 'vend' in c or 'seller' in c or 'agent' in c), None)
+
+    if col_id:
+        # IDs únicos de venda — o caso ideal
+        total_transacoes = int(df[col_id].nunique())
+    elif col_vendedor and col_data:
+        # Sem ID mas com vendedor: cada combinação data+vendedor = 1 transacção
+        total_transacoes = int(df.groupby([df[col_data].dt.date, col_vendedor]).ngroups)
+    elif col_data:
+        # Sem ID nem vendedor: cada data única = 1 "sessão" de vendas
+        total_transacoes = int(df[col_data].dt.date.nunique())
+    else:
+        total_transacoes = int(len(df))
 
     vendas_por_dia = df.groupby(df[col_data].dt.date)[col_total].sum()
     melhor_dia_str = (
