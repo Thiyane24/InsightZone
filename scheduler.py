@@ -56,11 +56,13 @@ def enviar_relatorios_periodicos():
 
             main_function(numero, pdf_url, pdf_filename)
 
-            # Guarda parquet para histórico e liberta imediatamente
+            # Guarda parquet para histórico — reutiliza ingest() uma única vez
+            # (antes havia um segundo ingest() desnecessário que duplicava I/O e RAM)
             semana_parquet = f"data/silver/{nome.replace(' ', '_')}_latest.parquet"
-            df_novo = ingest(ultimo_ficheiro)   # releitura limpa para persistência
-            df_novo.to_parquet(semana_parquet, index=False)
-            del df_novo
+            os.makedirs("data/silver", exist_ok=True)
+            df_parquet = ingest(ultimo_ficheiro)
+            df_parquet.to_parquet(semana_parquet, index=False)
+            del df_parquet
             gc.collect()
 
             # Actualiza histórico na base de dados

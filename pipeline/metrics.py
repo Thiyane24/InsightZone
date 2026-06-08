@@ -3,6 +3,77 @@ import pandas as pd
 from datetime import datetime
 
 
+def _parse_numero_pt(serie: pd.Series) -> pd.Series:
+    """
+    Converte uma coluna de texto com formato PT (ponto de milhar, vírgula decimal)
+    para float. Valores que não sejam convertíveis tornam-se NaN.
+    Exemplo: "1.500,00" → 1500.0 | "vinte" → NaN | "N/A" → NaN
+    """
+    return (
+        serie.astype(str)
+             .str.strip()
+             .str.replace(r'\.(?=\d{3})', '', regex=True)   # remove ponto de milhar
+             .str.replace(',', '.', regex=False)             # vírgula → ponto decimal
+             .pipe(lambda s: pd.to_numeric(s, errors='coerce'))
+    )
+
+
+def _parse_datas_robusto(serie: pd.Series) -> pd.Series:
+    """
+    Tenta múltiplos formatos de data em sequência, sem ambiguidade.
+    Formatos suportados:
+      YYYY-MM-DD  (ISO)
+      DD/MM/YYYY  (PT)
+      Month D, YYYY  (EN: "June 3, 2026")
+      DD-MM-YYYY
+    Datas inválidas (ex: "32/06/2026", "ontem") ficam NaT.
+    """
+    s = serie.astype(str).str.strip()
+    resultado = pd.Series([pd.NaT] * len(s), dtype='datetime64[ns]', index=serie.index)
+
+    for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%B %d, %Y', '%d-%m-%Y'):
+        mask = resultado.isna()
+        if not mask.any():
+            break
+        tentativa = pd.to_datetime(s.where(mask), format=fmt, errors='coerce')
+        resultado = resultado.fillna(tentativa)
+
+    return resultado
+
+
+def _validar_silver(df: pd.DataFrame, col_total: str, col_qtd: str | None) -> pd.DataFrame:
+    """
+    Rejeita linhas sujas ANTES de qualquer agregação.
+    Chamado uma vez, logo após a detecção de colunas.
+    """
+    # 1. Remover linhas completamente vazias
+    df = df.dropna(how='all')
+
+    # 2. Remover linhas que são headers repetidos (copy/paste errado)
+    col_id_raw = next((c for c in df.columns if c in ('id', 'fatura', 'recibo', 'order_id', 'invoice')), None)
+    if col_id_raw:
+        df = df[df[col_id_raw].astype(str).str.lower() != col_id_raw.lower()]
+
+    # 3. Total — formato PT + rejeitar nulo, zero e negativo
+    if col_total and col_total in df.columns:
+        df[col_total] = _parse_numero_pt(df[col_total])
+        df = df[df[col_total].notna()]
+        df = df[df[col_total] > 0]
+
+    # 4. Quantidade — rejeitar nulo e negativo (se coluna existir)
+    if col_qtd and col_qtd in df.columns:
+        df[col_qtd] = _parse_numero_pt(df[col_qtd])
+        df = df[df[col_qtd].notna()]
+        df = df[df[col_qtd] > 0]
+
+    # 5. Rejeitar linhas sem produto nem total (linhas incompletas críticas)
+    col_prod = next((c for c in df.columns if 'prod' in c or 'item' in c), None)
+    if col_prod and col_total:
+        df = df.dropna(subset=[col_prod, col_total])
+
+    return df.reset_index(drop=True)
+
+
 def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> dict:
 
     # 1. NORMALIZAÇÃO DE COLUNAS
@@ -14,45 +85,49 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     col_produto = next((c for c in df.columns if 'prod' in c or 'item' in c), None)
     col_qtd     = next((c for c in df.columns if 'qtd' in c or 'quant' in c or 'qty' in c), None)
 
-    # 3. FALLBACK: recalcula total a partir de preço × quantidade
-    if not col_total and col_qtd:
-        col_preco = next((c for c in df.columns if 'prec' in c or 'price' in c), None)
-        if col_preco:
-            df['total_calculado'] = (
-                pd.to_numeric(df[col_preco], errors='coerce').fillna(0)
-                * pd.to_numeric(df[col_qtd], errors='coerce').fillna(0)
-            )
-            col_total = 'total_calculado'
+    # 3. PREÇO UNITÁRIO — formato PT (antes do fallback de total)
+    col_preco = next((c for c in df.columns if 'prec' in c or 'price' in c), None)
+    if col_preco:
+        df[col_preco] = _parse_numero_pt(df[col_preco])
 
-    # 4. PARSING DE DATAS
-    #  criar coluna de fallback antes de tentar usá-la
+    # 4. FALLBACK: recalcula total a partir de preço × quantidade
+    if not col_total and col_qtd and col_preco:
+        df['total_calculado'] = (
+            df[col_preco].fillna(0) * _parse_numero_pt(df[col_qtd]).fillna(0)
+        )
+        col_total = 'total_calculado'
+
+    # ── VALIDAÇÃO SILVER ─────────────────────────────────────────────────────
+    # Corre ANTES de qualquer groupby/sum/cálculo.
+    # Rejeita: texto em campos numéricos, negativos, zeros, linhas vazias,
+    # headers repetidos, formato PT mal convertido.
+    df = _validar_silver(df, col_total, col_qtd)
+
+    if df.empty:
+        return _resultado_vazio()
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # 5. PARSING DE DATAS — múltiplos formatos, sem ambiguidade
     if col_data:
-        df[col_data] = pd.to_datetime(df[col_data], errors='coerce')
+        df[col_data] = _parse_datas_robusto(df[col_data])
         df = df.dropna(subset=[col_data])
-        # Se ficou vazio depois do dropna, usa fallback
         if df.empty:
-            df = df.copy()
             col_data = None
 
     if not col_data:
-        df = df.copy()
         df['data_fallback'] = pd.Timestamp(datetime.now().date())
         col_data = 'data_fallback'
 
-    # 5. TIPOS NUMÉRICOS
-    if col_total:
-        df[col_total] = pd.to_numeric(df[col_total], errors='coerce').fillna(0.0)
-    else:
+    # 6. TIPOS NUMÉRICOS FINAIS (Total e Qtd já foram limpos em _validar_silver)
+    if not col_total:
         df['total_zero'] = 0.0
         col_total = 'total_zero'
 
-    if col_qtd:
-        df[col_qtd] = pd.to_numeric(df[col_qtd], errors='coerce').fillna(1)
-    else:
+    if not col_qtd:
         df['qtd_um'] = 1
         col_qtd = 'qtd_um'
 
-    # 6. KPIs CORE
+    # 7. KPIs CORE
     total_faturado   = float(df[col_total].sum())
     col_id           = next((c for c in df.columns if c in ('id', 'fatura', 'recibo', 'order_id', 'invoice')), None)
     total_transacoes = int(df[col_id].nunique()) if col_id else int(len(df))
@@ -64,7 +139,7 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
         else datetime.now().strftime('%Y-%m-%d')
     )
 
-    # 7. TOP PRODUTOS converter para tipos Python nativos antes de libertar o df
+    # 8. TOP PRODUTOS
     if col_produto:
         top_produtos_dict = (
             df.groupby(col_produto)[col_qtd]
@@ -77,11 +152,11 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     else:
         top_produtos_dict = {"Nenhum produto detetado": 0}
 
-    # 8. MÉTRICAS AVANÇADAS
+    # 9. MÉTRICAS AVANÇADAS
     mes_nome     = datetime.now().strftime('%B')
     ticket_medio = total_faturado / total_transacoes if total_transacoes > 0 else 0.0
 
-    # 9. LIBERTAÇÃO EXPLÍCITA DA MEMÓRIA
+    # 10. LIBERTAÇÃO EXPLÍCITA DA MEMÓRIA
     del df
     gc.collect()
 
@@ -101,4 +176,18 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
         "mes_nome":            mes_nome,
 
         "variacao_pct": None,
+    }
+
+
+def _resultado_vazio() -> dict:
+    """Retorna estrutura vazia quando o ficheiro não tem dados válidos."""
+    mes_nome = datetime.now().strftime('%B')
+    return {
+        "total": 0.0, "total_transacoes": 0, "ticket_medio": 0.0,
+        "melhor_dia": datetime.now().strftime('%Y-%m-%d'),
+        "top_produtos": {"Sem dados válidos": 0},
+        "total_mensal": 0.0, "transacoes_mensal": 0, "ticket_medio_mensal": 0.0,
+        "melhor_dia_mes": datetime.now().strftime('%Y-%m-%d'),
+        "top_produtos_mes": {"Sem dados válidos": 0},
+        "mes_nome": mes_nome, "variacao_pct": None,
     }

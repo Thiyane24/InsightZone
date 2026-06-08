@@ -2,6 +2,8 @@ import pandas as pd
 import pdfplumber
 import os
 
+from pipeline.metrics import _parse_numero_pt, _parse_datas_robusto
+
 
 # Palavras-chave para cada coluna esperada
 MAPA_HEURISTICA = {
@@ -86,14 +88,13 @@ def _normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
         df = df[list(colunas_esperadas)].copy()
 
     try:
-        df['quantidade'] = pd.to_numeric(
-            df['quantidade'].astype(str).str.replace(r'[^\d]', '', regex=True), 
-            errors='coerce'
-        ).fillna(1).astype(int)
+        # Datas — múltiplos formatos sem ambiguidade (PT, ISO, EN)
+        df['data'] = _parse_datas_robusto(df['data'])
 
-        df['valor'] = df['valor'].astype(str).str.replace(r'[^\d,.]', '', regex=True)
-        df['valor'] = df['valor'].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-        df['valor'] = pd.to_numeric(df['valor'], errors='coerce').fillna(0.0).astype(float)
+        # Quantidade e valor — formato PT, NaN preservado para rejeição
+        # posterior pelo _validar_silver em metrics.py (não usar fillna aqui)
+        df['quantidade'] = _parse_numero_pt(df['quantidade'])
+        df['valor']      = _parse_numero_pt(df['valor'])
     except Exception as e:
         print(f"Erro na conversao de tipos: {e}")
 
