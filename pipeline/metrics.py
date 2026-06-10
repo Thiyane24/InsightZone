@@ -1,6 +1,6 @@
 import gc
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 def _parse_numero_pt(serie: pd.Series) -> pd.Series:
@@ -46,27 +46,22 @@ def _validar_silver(df: pd.DataFrame, col_total: str, col_qtd: str | None) -> pd
     Rejeita linhas sujas ANTES de qualquer agregação.
     Chamado uma vez, logo após a detecção de colunas.
     """
-    # 1. Remover linhas completamente vazias
     df = df.dropna(how='all')
 
-    # 2. Remover linhas que são headers repetidos (copy/paste errado)
     col_id_raw = next((c for c in df.columns if c in ('id', 'fatura', 'recibo', 'order_id', 'invoice')), None)
     if col_id_raw:
         df = df[df[col_id_raw].astype(str).str.lower() != col_id_raw.lower()]
 
-    # 3. Total — formato PT + rejeitar nulo, zero e negativo
     if col_total and col_total in df.columns:
         df[col_total] = _parse_numero_pt(df[col_total])
         df = df[df[col_total].notna()]
         df = df[df[col_total] > 0]
 
-    # 4. Quantidade — rejeitar nulo e negativo (se coluna existir)
     if col_qtd and col_qtd in df.columns:
         df[col_qtd] = _parse_numero_pt(df[col_qtd])
         df = df[df[col_qtd].notna()]
         df = df[df[col_qtd] > 0]
 
-    # 5. Rejeitar linhas sem produto nem total (linhas incompletas críticas)
     col_prod = next((c for c in df.columns if 'prod' in c or 'item' in c), None)
     if col_prod and col_total:
         df = df.dropna(subset=[col_prod, col_total])
@@ -74,7 +69,61 @@ def _validar_silver(df: pd.DataFrame, col_total: str, col_qtd: str | None) -> pd
     return df.reset_index(drop=True)
 
 
-def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> dict:
+def _hora_de_pico(df: pd.DataFrame, col_data: str) -> str | None:
+    """
+    Detecta a hora com mais vendas no DataFrame.
+    Só funciona se a coluna de data tiver componente de hora (ex: "2026-06-10 14:30").
+    Devolve string "14h-15h" ou None se não houver informação de hora.
+    """
+    try:
+        horas = df[col_data].dt.hour
+        # Se todos os valores de hora são 0, provavelmente é só data sem hora
+        if horas.nunique() <= 1:
+            return None
+        hora_pico = int(horas.value_counts().idxmax())
+        return f"{hora_pico:02d}h–{hora_pico + 1:02d}h"
+    except Exception:
+        return None
+
+
+def _variacao_ontem(df: pd.DataFrame, col_data: str, col_total: str) -> float | None:
+    """
+    Compara a faturação de hoje com a de ontem.
+    Devolve a variação em percentagem (positivo = crescimento, negativo = queda).
+    Devolve None se não houver dados de ontem no DataFrame.
+    """
+    try:
+        hoje   = datetime.now().date()
+        ontem  = hoje - timedelta(days=1)
+
+        vendas_por_dia = df.groupby(df[col_data].dt.date)[col_total].sum()
+
+        total_hoje  = vendas_por_dia.get(hoje, None)
+        total_ontem = vendas_por_dia.get(ontem, None)
+
+        # Precisa de ter os dois dias para calcular variação
+        if total_hoje is None or total_ontem is None or total_ontem == 0:
+            return None
+
+        return round(((total_hoje - total_ontem) / total_ontem) * 100, 1)
+    except Exception:
+        return None
+
+
+def calcular_metricas(
+    df: pd.DataFrame,
+    frequencia_cliente: str = "semanal",
+    periodo: str | None = None,        # NOVO: "hoje", "semana", "mes" ou None (comportamento anterior)
+) -> dict:
+    """
+    Calcula métricas de vendas a partir de um DataFrame.
+
+    Parâmetro `periodo`:
+      - None      → comportamento anterior (filtra pelo ano mais recente)
+      - "hoje"    → só as linhas de hoje — usado pelo scheduler diário
+      - "semana"  → semana corrente (segunda a domingo)
+      - "mes"     → mês corrente
+    """
 
     # 1. NORMALIZAÇÃO DE COLUNAS
     df.columns = [col.lower().strip() for col in df.columns]
@@ -91,20 +140,13 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
         df[col_preco] = _parse_numero_pt(df[col_preco])
 
     # 4. CÁLCULO DO TOTAL REAL
-    # FIX BUG 3: NÃO recalcular total quando col_total já existe.
-    # A multiplicação col_total × col_qtd inflacionava os valores ao quadrado.
-    # Só calcular total_calculado quando col_total NÃO existe.
     if col_qtd:
         qtd_serie = _parse_numero_pt(df[col_qtd])
         if not col_total and col_preco:
-            # Fallback: sem coluna de total, usar preço × quantidade
             df['total_calculado'] = df[col_preco].fillna(0) * qtd_serie.fillna(0)
             col_total = 'total_calculado'
 
-    # ── VALIDAÇÃO SILVER ─────────────────────────────────────────────────────
-    # Corre ANTES de qualquer groupby/sum/cálculo.
-    # Rejeita: texto em campos numéricos, negativos, zeros, linhas vazias,
-    # headers repetidos, formato PT mal convertido.
+    # ── VALIDAÇÃO SILVER ──────────────────────────────────────────────────────
     df = _validar_silver(df, col_total, col_qtd)
 
     if df.empty:
@@ -115,11 +157,32 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     if col_data:
         df[col_data] = _parse_datas_robusto(df[col_data])
         df = df.dropna(subset=[col_data])
-        # FIX BUG 2: aceitar APENAS o ano mais recente nos dados.
-        # Antes aceitava ano_mais_recente - 1, o que deixava datas antigas passar
-        # e causava pico de vendas em anos anteriores.
-        ano_mais_recente = int(df[col_data].dt.year.max())
-        df = df[df[col_data].dt.year == ano_mais_recente]  # <-- ALTERADO: >= para ==
+
+        # ── FILTRO DE PERÍODO ─────────────────────────────────────────────────
+        # NOVO: filtra o DataFrame conforme o período pedido.
+        # Sem período → comportamento original (ano mais recente).
+        hoje = datetime.now().date()
+
+        if periodo == "hoje":
+            df = df[df[col_data].dt.date == hoje]
+
+        elif periodo == "semana":
+            # Segunda-feira da semana corrente até hoje
+            inicio_semana = hoje - timedelta(days=hoje.weekday())
+            df = df[(df[col_data].dt.date >= inicio_semana) & (df[col_data].dt.date <= hoje)]
+
+        elif periodo == "mes":
+            df = df[
+                (df[col_data].dt.year  == hoje.year) &
+                (df[col_data].dt.month == hoje.month)
+            ]
+
+        else:
+            # Comportamento original: só o ano mais recente
+            ano_mais_recente = int(df[col_data].dt.year.max())
+            df = df[df[col_data].dt.year == ano_mais_recente]
+        # ─────────────────────────────────────────────────────────────────────
+
         if df.empty:
             col_data = None
 
@@ -127,7 +190,7 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
         df['data_fallback'] = pd.Timestamp(datetime.now().date())
         col_data = 'data_fallback'
 
-    # 6. TIPOS NUMÉRICOS FINAIS (Total e Qtd já foram limpos em _validar_silver)
+    # 6. TIPOS NUMÉRICOS FINAIS
     if not col_total:
         df['total_zero'] = 0.0
         col_total = 'total_zero'
@@ -139,23 +202,14 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     # 7. KPIs CORE
     total_faturado = float(df[col_total].sum())
 
-    # BUG 1 — LIMITAÇÃO ESTRUTURAL (não é bug do código, é do ficheiro)
-    # Ficheiros sem coluna de ID de venda única (ex: mercearia simples)
-    # caem no fallback len(df), que conta itens, não transacções.
-    # Comportamento correcto dado o tipo de ficheiro — documentado abaixo.
     col_id       = next((c for c in df.columns if c in ('id', 'fatura', 'recibo', 'order_id', 'invoice')), None)
     col_vendedor = next((c for c in df.columns if 'vend' in c or 'seller' in c or 'agent' in c), None)
 
     if col_id:
-        # IDs únicos de venda — o caso ideal
         total_transacoes = int(df[col_id].nunique())
     elif col_vendedor and col_data:
-        # Sem ID mas com vendedor: cada combinação data+vendedor = 1 transacção
         total_transacoes = int(df.groupby([df[col_data].dt.date, col_vendedor]).ngroups)
     else:
-        # Sem ID nem vendedor: cada linha = 1 item vendido (não = 1 transacção).
-        # Para ficheiros de mercearia/retalho sem POS, este é o comportamento esperado.
-        # O relatório deve reflectir "itens vendidos" em vez de "transacções".
         total_transacoes = int(len(df))
 
     vendas_por_dia = df.groupby(df[col_data].dt.date)[col_total].sum()
@@ -182,6 +236,38 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
     mes_nome     = datetime.now().strftime('%B')
     ticket_medio = total_faturado / total_transacoes if total_transacoes > 0 else 0.0
 
+    # ── MÉTRICAS DIÁRIAS ──────────────────────────────────────────────────────
+    # NOVO: só calculadas quando periodo == "hoje" ou frequencia_cliente == "diario"
+    # Para os outros períodos ficam None — o report.py ignora-as se forem None.
+
+    hora_pico         = None
+    variacao_ontem    = None
+    produto_do_dia    = None
+
+    if periodo == "hoje" or frequencia_cliente == "diario":
+
+        # Hora de pico — precisa de coluna de data com componente de hora
+        hora_pico = _hora_de_pico(df, col_data)
+
+        # Variação face a ontem — precisa de dados de ontem no mesmo ficheiro
+        # Para relatórios diários o ficheiro enviado pelo cliente pode ter vários dias,
+        # o que permite esta comparação.
+        variacao_ontem = _variacao_ontem(df, col_data, col_total)
+
+        # Produto mais vendido do dia — o #1 do top já existe, mas isolamos aqui
+        # para o report.py o poder destacar visualmente de forma diferente do Top 5.
+        if col_produto and top_produtos_dict:
+            primeiro = list(top_produtos_dict.keys())[0]
+            if primeiro != "Nenhum produto detetado":
+                produto_do_dia = {
+                    "nome":       primeiro,
+                    "quantidade": top_produtos_dict[primeiro],
+                    "faturacao":  float(
+                        df[df[col_produto].astype(str) == primeiro][col_total].sum()
+                    ),
+                }
+    # ─────────────────────────────────────────────────────────────────────────
+
     # 10. LIBERTAÇÃO EXPLÍCITA DA MEMÓRIA
     del df
     gc.collect()
@@ -201,7 +287,12 @@ def calcular_metricas(df: pd.DataFrame, frequencia_cliente: str = "semanal") -> 
         "top_produtos_mes":    top_produtos_dict,
         "mes_nome":            mes_nome,
 
-        "variacao_pct": None,
+        "variacao_pct":        None,        # reservado para comparação multi-período futura
+
+        # ── Métricas diárias (None quando não aplicável) ──────────────────────
+        "hora_pico":           hora_pico,       # "14h–15h" ou None
+        "variacao_ontem":      variacao_ontem,  # float (%) ou None
+        "produto_do_dia":      produto_do_dia,  # dict {nome, quantidade, faturacao} ou None
     }
 
 
@@ -216,4 +307,6 @@ def _resultado_vazio() -> dict:
         "melhor_dia_mes": datetime.now().strftime('%Y-%m-%d'),
         "top_produtos_mes": {"Sem dados válidos": 0},
         "mes_nome": mes_nome, "variacao_pct": None,
+        # Métricas diárias também vazias
+        "hora_pico": None, "variacao_ontem": None, "produto_do_dia": None,
     }

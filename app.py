@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime
 
 import httpx
+import pandas as pd
 import psycopg2
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
@@ -23,23 +24,46 @@ from pipeline.storage import upload_pdf, upload_ficheiro_vendas, download_fichei
 
 load_dotenv()
 
-# Deduplicação de mensagens — evita processar o mesmo webhook duas vezes
-# (o Meta faz retry automático se não recebe 200 a tempo)
 _mensagens_vistas: set = set()
 
+# ALTERADO: adicionada opção 6 (frequencia) no MENU e no AJUDA
 MENU = """Ola! Sou o InsightZone.
 Modo atual: {frequencia}
 
 1. Enviar ficheiro de vendas em formato CSV, Excel ou PDF para receber o relatorio.
 2. Ver relatorio anterior
 3. Resumo rapido
-4. Top 5 produtos"""
+4. Top 5 produtos
+5. Introduzir vendas por texto
+6. Mudar frequencia dos relatorios"""
 
 AJUDA = """Comandos disponiveis:
 - Envia um ficheiro CSV, Excel ou PDF para receber o teu relatorio
 - 'relatorio' ou '2' — ver ultimo relatorio
 - 'resumo' ou '3' — 3 KPIs rapidos
-- 'top' ou '4' — top 5 produtos"""
+- 'top' ou '4' — top 5 produtos
+- 'vendas' ou '5' — introduzir vendas por texto
+- 'frequencia' ou '6' — mudar frequencia dos relatorios"""
+
+INSTRUCOES_VENDAS = """Envia as tuas vendas no formato:
+produto, quantidade, valor
+
+Exemplo:
+Frango, 3, 250
+Arroz, 5, 150
+Feijao, 2, 80
+
+Envia 'cancelar' para sair."""
+
+# NOVO: mensagem enviada quando o cliente quer mudar a frequência
+# Fica numa constante para ser fácil de editar sem tocar na lógica.
+INSTRUCOES_FREQUENCIA = """Com que frequencia queres receber os teus relatorios?
+
+1. Diariamente (todos os dias as 20h)
+2. Semanalmente (segunda-feira as 8h)
+3. Mensalmente (1º dia do mes as 8h)
+
+Envia 'cancelar' para manter a opcao actual."""
 
 
 # ── SEGURANÇA SHA-256 ─────────────────────────────────────────────────────────
@@ -49,8 +73,6 @@ def verificar_assinatura_meta(payload_bytes: bytes, signature_header: str) -> bo
     if not secret:
         print("Aviso: META_APP_SECRET não configurado no .env")
         return False
-    # BUG CORRIGIDO: hmac.new() não existe em Python — usar hmac.new é alias de hmac.HMAC
-    # A forma correcta é hmac.new(key, msg, digestmod)
     mac = hmac.new(secret.encode(), payload_bytes, hashlib.sha256)
     expected = mac.hexdigest()
     return hmac.compare_digest(f"sha256={expected}", signature_header)
@@ -59,7 +81,6 @@ def verificar_assinatura_meta(payload_bytes: bytes, signature_header: str) -> bo
 # ── BASE DE DADOS ─────────────────────────────────────────────────────────────
 
 def get_conn():
-    """Abre uma ligação à base de dados PostgreSQL."""
     return psycopg2.connect(os.getenv("DATABASE_URL"))
 
 
@@ -70,13 +91,12 @@ def limpar_numero(phone_number: str) -> str:
 
 
 def carregar_cliente(phone_number: str) -> dict | None:
-    """Busca um cliente pelo número. Devolve dict ou None se não existir."""
     numero_limpo = limpar_numero(phone_number)
     try:
         conn   = get_conn()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico, ultimo_ficheiro_url "
+            "SELECT numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico, ultimo_ficheiro_url, modo "
             "FROM clientes WHERE numero = %s",
             (numero_limpo,)
         )
@@ -94,6 +114,7 @@ def carregar_cliente(phone_number: str) -> dict | None:
             "onboarding_passo":     row[5],
             "historico":            json.loads(row[6]) if row[6] else [],
             "ultimo_ficheiro_url":  row[7],
+            "modo":                 row[8],
         }
     except Exception as e:
         print(f"Erro ao carregar cliente: {e}")
@@ -101,7 +122,6 @@ def carregar_cliente(phone_number: str) -> dict | None:
 
 
 def criar_cliente(numero_limpo: str):
-    """Insere um novo cliente na base de dados."""
     try:
         conn   = get_conn()
         cursor = conn.cursor()
@@ -118,7 +138,6 @@ def criar_cliente(numero_limpo: str):
 
 
 def actualizar_cliente(numero_limpo: str, campos: dict):
-    """Actualiza campos específicos de um cliente."""
     if not campos:
         return
     try:
@@ -135,12 +154,11 @@ def actualizar_cliente(numero_limpo: str, campos: dict):
 
 
 def carregar_todos_clientes() -> list:
-    """Devolve todos os clientes — usado pelo scheduler."""
     try:
         conn   = get_conn()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico "
+            "SELECT numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico, ultimo_ficheiro_url, modo "
             "FROM clientes"
         )
         rows = cursor.fetchall()
@@ -148,13 +166,15 @@ def carregar_todos_clientes() -> list:
         conn.close()
         return [
             {
-                "numero":              r[0],
-                "nome":                r[1],
-                "negocio":             r[2],
-                "frequencia":          r[3] or "semanal",
+                "numero":               r[0],
+                "nome":                 r[1],
+                "negocio":              r[2],
+                "frequencia":           r[3] or "semanal",
                 "ultimo_relatorio_url": r[4],
-                "onboarding_passo":    r[5],
-                "historico":           json.loads(r[6]) if r[6] else [],
+                "onboarding_passo":     r[5],
+                "historico":            json.loads(r[6]) if r[6] else [],
+                "ultimo_ficheiro_url":  r[7],
+                "modo":                 r[8],
             }
             for r in rows
         ]
@@ -170,7 +190,6 @@ def tratar_onboarding(phone_number: str, texto: str, cliente: dict):
     numero_limpo = limpar_numero(phone_number)
 
     if passo == 1:
-        # BUG CORRIGIDO: guardar o nome E avançar o passo numa só operação
         nome = texto.strip()
         if not nome:
             enviar_mensagem(numero_limpo, "Por favor envia o nome do teu negocio.")
@@ -182,10 +201,10 @@ def tratar_onboarding(phone_number: str, texto: str, cliente: dict):
         tipos   = {"1": "servicos", "2": "retalho", "3": "agropecuaria", "4": "outro"}
         negocio = tipos.get(texto.strip(), texto.strip())
         actualizar_cliente(numero_limpo, {"negocio": negocio, "onboarding_passo": 3})
-        enviar_mensagem(numero_limpo, "Como preferes receber os relatorios?\n1. Semanalmente\n2. Mensalmente")
+        enviar_mensagem(numero_limpo, "Como preferes receber os relatorios?\n1. Diariamente (todos os dias as 20h)\n2. Semanalmente (segunda-feira as 8h)\n3. Mensalmente (1º dia do mes as 8h)")
 
     elif passo == 3:
-        freq_map   = {"1": "semanal", "2": "mensal"}
+        freq_map   = {"1": "diario", "2": "semanal", "3": "mensal"}
         frequencia = freq_map.get(texto.strip(), "semanal")
         actualizar_cliente(numero_limpo, {"frequencia": frequencia, "onboarding_passo": 0})
         enviar_mensagem(
@@ -195,13 +214,94 @@ def tratar_onboarding(phone_number: str, texto: str, cliente: dict):
         )
 
 
+# ── PARSER DE VENDAS POR TEXTO ────────────────────────────────────────────────
+
+def parsear_vendas_texto(texto: str) -> pd.DataFrame | None:
+    linhas = texto.strip().splitlines()
+    vendas = []
+    hoje   = datetime.now().strftime("%Y-%m-%d")
+
+    for linha in linhas:
+        if not linha.strip():
+            continue
+        partes = [p.strip() for p in linha.split(",")]
+        if len(partes) != 3:
+            continue
+        try:
+            produto    = partes[0]
+            quantidade = float(partes[1])
+            valor      = float(partes[2])
+            vendas.append({"data": hoje, "produto": produto, "quantidade": quantidade, "valor": valor})
+        except ValueError:
+            continue
+
+    if not vendas:
+        return None
+
+    return pd.DataFrame(vendas)
+
+
+def processar_vendas_texto_background(numero_limpo: str, texto: str, nome_cliente: str, frequencia: str):
+    filepath_temp = None
+    try:
+        df = parsear_vendas_texto(texto)
+
+        if df is None:
+            enviar_mensagem(numero_limpo, "Nao consegui ler as vendas. Usa o formato:\nproduto, quantidade, valor\n\nExemplo:\nFrango, 3, 250")
+            actualizar_cliente(numero_limpo, {"modo": None})
+            return
+
+        os.makedirs("data/uploads", exist_ok=True)
+        timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath_temp = f"data/uploads/vendas_texto_{numero_limpo}_{timestamp}.csv"
+        df.to_csv(filepath_temp, index=False)
+
+        # ALTERADO: passa periodo="hoje" quando frequência é diária para filtrar
+        # só as vendas de hoje e calcular métricas diárias (hora de pico, etc.)
+        periodo  = "hoje" if frequencia == "diario" else None
+        metricas = calcular_metricas(df, frequencia_cliente=frequencia, periodo=periodo)
+        del df
+        gc.collect()
+
+        timestamp_label    = datetime.now().strftime('%Y%m%d_%H%M%S')
+        hash_unico         = uuid.uuid4().hex[:6]
+        pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
+
+        # ALTERADO: passa is_diario=True quando frequência é diária para activar
+        # a secção "Destaques do Dia" no PDF
+        is_diario = (frequencia == "diario")
+        pdf_path  = gerar_relatorio(
+            metricas, nome_negocio=nome_cliente,
+            semana_label=pdf_filename_limpo, is_diario=is_diario
+        )
+        pdf_url = upload_pdf(pdf_path)
+
+        ficheiro_url = upload_ficheiro_vendas(filepath_temp)
+
+        actualizar_cliente(numero_limpo, {
+            "ultimo_relatorio_url": pdf_url,
+            "ultimo_ficheiro_url":  ficheiro_url,
+            "modo":                 None,
+        })
+
+        main_function(numero_limpo, pdf_url, pdf_filename_limpo, mensagem=f"O teu relatorio {frequencia} esta pronto:")
+        print(f"Vendas por texto processadas com sucesso para {numero_limpo}")
+
+    except Exception as e:
+        print(f"Erro ao processar vendas por texto: {e}")
+        actualizar_cliente(numero_limpo, {"modo": None})
+
+    finally:
+        if filepath_temp and os.path.exists(filepath_temp):
+            try:
+                os.remove(filepath_temp)
+            except Exception:
+                pass
+
+
 # ── BACKGROUND TASKS ──────────────────────────────────────────────────────────
 
 def gerar_relatorio_background(phone_number: str, pdf_url: str, nome_cliente: str, frequencia_atual: str):
-    """
-    BUG CORRIGIDO: já não tenta re-processar ficheiro local (que foi apagado).
-    Reenvia o último PDF guardado no Cloudinary directamente.
-    """
     try:
         numero_limpo = limpar_numero(phone_number)
         if not pdf_url:
@@ -248,19 +348,22 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
         cliente    = carregar_cliente(numero_limpo)
         frequencia = cliente.get("frequencia", "semanal") if cliente else "semanal"
 
-        metricas     = calcular_metricas(df, frequencia_cliente=frequencia)
+        # ALTERADO: passa periodo="hoje" e is_diario=True quando frequência é diária
+        periodo   = "hoje" if frequencia == "diario" else None
+        metricas  = calcular_metricas(df, frequencia_cliente=frequencia, periodo=periodo)
         nome_empresa = cliente["nome"] if cliente and cliente.get("nome") else "O meu negocio"
 
         timestamp_label    = datetime.now().strftime('%Y%m%d_%H%M%S')
         hash_unico         = uuid.uuid4().hex[:6]
         pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
 
-        pdf_path = gerar_relatorio(metricas, nome_negocio=nome_empresa, semana_label=pdf_filename_limpo)
+        is_diario = (frequencia == "diario")
+        pdf_path  = gerar_relatorio(
+            metricas, nome_negocio=nome_empresa,
+            semana_label=pdf_filename_limpo, is_diario=is_diario
+        )
 
-        # Upload do PDF (storage.py apaga o ficheiro local)
-        pdf_url = upload_pdf(pdf_path)
-
-        # Upload do ficheiro de vendas para o Cloudinary (para recalcular resumo/top depois)
+        pdf_url      = upload_pdf(pdf_path)
         ficheiro_url = upload_ficheiro_vendas(filepath)
 
         actualizar_cliente(numero_limpo, {
@@ -280,7 +383,6 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
             pass
 
     finally:
-        # Apaga apenas o ficheiro de vendas temporário (o PDF é apagado pelo storage.py)
         if filepath and os.path.exists(filepath):
             try:
                 os.remove(filepath)
@@ -292,7 +394,6 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
 # ── RESUMO E TOP (background) ─────────────────────────────────────────────────
 
 def _carregar_df_cliente(numero_limpo: str, ficheiro_url: str):
-    """Descarrega o ficheiro de vendas do Cloudinary e devolve um DataFrame."""
     import tempfile
     ext = ficheiro_url.split(".")[-1].lower()
     if ext not in ("csv", "xlsx", "xls", "pdf"):
@@ -307,13 +408,13 @@ def _carregar_df_cliente(numero_limpo: str, ficheiro_url: str):
 
 
 def _resumo_background(numero_limpo: str, ficheiro_url: str, frequencia_atual: str):
-    """Envia 3 KPIs rápidos recalculados a partir dos dados originais."""
     try:
         if not ficheiro_url:
             enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
             return
         df       = _carregar_df_cliente(numero_limpo, ficheiro_url)
-        metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
+        periodo  = "hoje" if frequencia_atual == "diario" else None
+        metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual, periodo=periodo)
         if frequencia_atual == "mensal":
             resumo = (
                 f"Resumo do Mes ({metricas['mes_nome']}):\n"
@@ -322,6 +423,24 @@ def _resumo_background(numero_limpo: str, ficheiro_url: str, frequencia_atual: s
                 f"Ticket medio: {metricas['ticket_medio_mensal']:.2f} MZN\n"
                 f"Melhor dia: {metricas['melhor_dia_mes']}"
             )
+        elif frequencia_atual == "diario":
+            # NOVO: resumo diário inclui as três métricas novas se disponíveis
+            linhas = [
+                f"Resumo de hoje ({datetime.now().strftime('%d/%m/%Y')}):",
+                f"Faturacao: {metricas['total']:.2f} MZN",
+                f"Itens vendidos: {metricas['total_transacoes']}",
+                f"Ticket medio: {metricas['ticket_medio']:.2f} MZN",
+            ]
+            if metricas.get("produto_do_dia"):
+                p = metricas["produto_do_dia"]
+                linhas.append(f"Produto do dia: {p['nome']} ({p['quantidade']} un)")
+            if metricas.get("hora_pico"):
+                linhas.append(f"Hora de pico: {metricas['hora_pico']}")
+            if metricas.get("variacao_ontem") is not None:
+                v = metricas["variacao_ontem"]
+                sinal = "+" if v >= 0 else ""
+                linhas.append(f"Vs ontem: {sinal}{v:.1f}%")
+            resumo = "\n".join(linhas)
         else:
             resumo = (
                 f"Resumo da semana:\n"
@@ -337,13 +456,13 @@ def _resumo_background(numero_limpo: str, ficheiro_url: str, frequencia_atual: s
 
 
 def _top_background(numero_limpo: str, ficheiro_url: str, frequencia_atual: str):
-    """Envia o Top 5 produtos recalculado a partir dos dados originais."""
     try:
         if not ficheiro_url:
             enviar_mensagem(numero_limpo, "Ainda nao tens dados. Envia um ficheiro CSV ou Excel primeiro.")
             return
         df       = _carregar_df_cliente(numero_limpo, ficheiro_url)
-        metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual)
+        periodo  = "hoje" if frequencia_atual == "diario" else None
+        metricas = calcular_metricas(df, frequencia_cliente=frequencia_atual, periodo=periodo)
         top      = metricas["top_produtos_mes"] if frequencia_atual == "mensal" else metricas["top_produtos"]
         if not top or list(top.keys())[0] == "Nenhum produto detetado":
             enviar_mensagem(numero_limpo, "Nao foi possivel identificar produtos no teu ficheiro.")
@@ -371,9 +490,6 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         print(f"Erro critico: nao foi possivel criar/carregar cliente {numero_limpo}")
         return
 
-    # Passo 1: sem nome ainda
-    # - saudação → envia boas-vindas e aguarda próxima mensagem com o nome
-    # - qualquer outro texto → já é o nome, processa directamente
     if cliente["onboarding_passo"] == 1 and not cliente.get("nome"):
         saudacoes = {"ola", "olá", "oi", "hello", "hi", "bom dia", "boa tarde", "boa noite", "novo"}
         if texto in saudacoes or len(texto.strip()) <= 2:
@@ -387,8 +503,48 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         return
 
     frequencia_atual     = cliente.get("frequencia", "semanal")
+    nome_cliente         = cliente.get("nome") or "O meu negocio"
     ultimo_relatorio_url = cliente.get("ultimo_relatorio_url")
     ultimo_ficheiro_url  = cliente.get("ultimo_ficheiro_url")
+
+    # ── Modo aguardar_vendas ──────────────────────────────────────────────────
+    if cliente.get("modo") == "aguardar_vendas":
+        if texto == "cancelar":
+            actualizar_cliente(numero_limpo, {"modo": None})
+            enviar_mensagem(numero_limpo, "Introducao de vendas cancelada.")
+            return
+        background_tasks.add_task(
+            processar_vendas_texto_background,
+            numero_limpo, texto_original, nome_cliente, frequencia_atual
+        )
+        return
+
+    # NOVO: Modo aguardar_frequencia — cliente está a escolher a nova frequência
+    # Funciona igual ao modo aguardar_vendas: guarda o estado na BD e intercepta
+    # a próxima mensagem antes de qualquer outro comando.
+    if cliente.get("modo") == "aguardar_frequencia":
+        if texto == "cancelar":
+            actualizar_cliente(numero_limpo, {"modo": None})
+            enviar_mensagem(numero_limpo, f"Operacao cancelada. Frequencia mantida: {frequencia_atual}.")
+            return
+
+        # Mapeamento das três opções para os valores guardados na BD
+        freq_map = {"1": "diario", "2": "semanal", "3": "mensal"}
+        nova_freq = freq_map.get(texto.strip())
+
+        if not nova_freq:
+            # Resposta inválida — pede de novo sem sair do modo
+            enviar_mensagem(numero_limpo, "Opcao invalida. Envia 1, 2 ou 3.\n\n" + INSTRUCOES_FREQUENCIA)
+            return
+
+        # Guarda a nova frequência e limpa o modo numa só operação
+        actualizar_cliente(numero_limpo, {"frequencia": nova_freq, "modo": None})
+        enviar_mensagem(
+            numero_limpo,
+            f"Frequencia actualizada para: {nova_freq.upper()}.\n"
+            f"Vais passar a receber os teus relatorios {nova_freq}."
+        )
+        return
 
     if texto in ["ola", "olá", "oi", "hello", "hi", "bom dia", "boa tarde", "boa noite"]:
         enviar_mensagem(numero_limpo, MENU.format(frequencia=frequencia_atual.upper()))
@@ -401,7 +557,7 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         enviar_mensagem(numero_limpo, "A preparar o teu documento estrategico. Aguarda um momento...")
         background_tasks.add_task(
             gerar_relatorio_background,
-            numero_limpo, ultimo_relatorio_url, cliente["nome"], frequencia_atual
+            numero_limpo, ultimo_relatorio_url, nome_cliente, frequencia_atual
         )
         return
 
@@ -421,6 +577,19 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         background_tasks.add_task(
             _top_background, numero_limpo, ultimo_ficheiro_url, frequencia_atual
         )
+        return
+
+    if texto in ["vendas", "5"]:
+        actualizar_cliente(numero_limpo, {"modo": "aguardar_vendas"})
+        enviar_mensagem(numero_limpo, INSTRUCOES_VENDAS)
+        return
+
+    # NOVO: comando frequencia / 6
+    # Activa o modo aguardar_frequencia e mostra as três opções.
+    # O cliente responde 1, 2 ou 3 na próxima mensagem — tratado acima.
+    if texto in ["frequencia", "frequência", "6"]:
+        actualizar_cliente(numero_limpo, {"modo": "aguardar_frequencia"})
+        enviar_mensagem(numero_limpo, INSTRUCOES_FREQUENCIA)
         return
 
     enviar_mensagem(numero_limpo, AJUDA)
@@ -486,7 +655,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
     except (KeyError, IndexError, TypeError):
         return Response(content="OK", status_code=200)
 
-    # Ignora mensagens já processadas (retries automáticos do Meta)
     if message_id and message_id in _mensagens_vistas:
         return Response(content="OK", status_code=200)
     if message_id:
@@ -501,7 +669,6 @@ async def receber_webhook(request: Request, background_tasks: BackgroundTasks):
     elif tipo == "document":
         cliente = carregar_cliente(phone_number)
 
-        # BUG CORRIGIDO: se ainda em onboarding, tratar como texto "documento" não "novo"
         if not cliente or cliente.get("onboarding_passo", 0) > 0:
             enviar_mensagem(
                 limpar_numero(phone_number),

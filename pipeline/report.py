@@ -19,6 +19,10 @@ def _cores():
         'BLACK':      colors.HexColor('#0F172A'),
         'ALERT_BG':   colors.HexColor('#FEF3C7'),
         'ALERT_TXT':  colors.HexColor('#92400E'),
+        'DAILY_BG':   colors.HexColor('#F0FDF4'),   # NOVO: fundo verde claro para secção diária
+        'DAILY_TXT':  colors.HexColor('#166534'),   # NOVO: texto verde escuro
+        'UP_COLOR':   colors.HexColor('#15803D'),   # NOVO: verde para variação positiva
+        'DOWN_COLOR': colors.HexColor('#B91C1C'),   # NOVO: vermelho para variação negativa
     }
 
 
@@ -31,7 +35,7 @@ def _dims():
     return PAGE_W, PAGE_H, MARGIN, PAGE_W - (2 * MARGIN)
 
 
-# ── ESTILOS (construídos uma vez por chamada a gerar_relatorio) ───────────────
+# ── ESTILOS ───────────────────────────────────────────────────────────────────
 def _styles():
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
@@ -48,6 +52,10 @@ def _styles():
         'table_cell_c': ParagraphStyle('table_cell_c', fontName='Helvetica',      fontSize=9,                textColor=c['BLACK'],     alignment=TA_CENTER,  wordWrap='CJK'),
         'alert_p':      ParagraphStyle('alert_p',      fontName='Helvetica',      fontSize=9.5, leading=13,  textColor=c['ALERT_TXT'], alignment=TA_JUSTIFY),
         'footer':       ParagraphStyle('footer',       fontName='Helvetica',      fontSize=8,                textColor=c['MID_GREY'],  alignment=TA_CENTER),
+        # NOVO: estilos para secção diária
+        'daily_lbl':    ParagraphStyle('daily_lbl',    fontName='Helvetica',      fontSize=8,                textColor=c['DAILY_TXT'], alignment=TA_CENTER),
+        'daily_val':    ParagraphStyle('daily_val',    fontName='Helvetica-Bold', fontSize=13,               textColor=c['DAILY_TXT'], alignment=TA_CENTER),
+        'daily_p':      ParagraphStyle('daily_p',      fontName='Helvetica',      fontSize=9.5, leading=13,  textColor=c['DAILY_TXT'], alignment=TA_JUSTIFY),
     }
 
 
@@ -73,9 +81,9 @@ def _kpi_block(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: float):
 
     kpis = [
         ('FATURAÇÃO TOTAL', _fmt_mzn(total)),
-        ('ITENS VENDIDOS',  str(trans)),        # ALTERADO: era 'TRANSAÇÕES'
+        ('ITENS VENDIDOS',  str(trans)),
         ('TICKET MÉDIO',    _fmt_mzn(ticket)),
-        ('MELHOR DIA',  str(melhor_dia)),
+        ('MELHOR DIA',      str(melhor_dia)),
     ]
 
     header_cells = [Paragraph(lbl, styles['kpi_lbl']) for lbl, _ in kpis]
@@ -92,6 +100,76 @@ def _kpi_block(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: float):
         ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
     ]))
     return t
+
+
+# ── SECÇÃO DIÁRIA (NOVA) ──────────────────────────────────────────────────────
+def _daily_highlights(metricas: dict, styles: dict, UTIL_W: float):
+    """
+    Bloco de destaque para relatórios diários com três métricas novas:
+      - Produto do dia (nome, quantidade, faturação)
+      - Hora de pico de vendas
+      - Variação face a ontem (%)
+
+    Só é chamada quando pelo menos uma das métricas diárias não é None.
+    Se uma métrica individual for None (ex: sem dados de hora), essa célula
+    mostra "—" em vez de crashar.
+    """
+    from reportlab.platypus import Table, Paragraph
+    from reportlab.platypus import TableStyle
+    c = _cores()
+
+    produto_do_dia = metricas.get('produto_do_dia')  # dict ou None
+    hora_pico      = metricas.get('hora_pico')        # "14h–15h" ou None
+    variacao_ontem = metricas.get('variacao_ontem')   # float (%) ou None
+
+    # ── Linha 1: Produto do dia ───────────────────────────────────────────────
+    if produto_do_dia:
+        nome_prod  = str(produto_do_dia['nome']).strip().title()
+        qty_prod   = int(produto_do_dia['quantidade'])
+        fat_prod   = float(produto_do_dia['faturacao'])
+        prod_val   = f"{nome_prod}\n{qty_prod} un · {_fmt_mzn(fat_prod)}"
+    else:
+        prod_val = "—"
+
+    # ── Linha 2: Hora de pico ─────────────────────────────────────────────────
+    hora_val = hora_pico if hora_pico else "—"
+
+    # ── Linha 3: Variação face a ontem ────────────────────────────────────────
+    # A cor muda conforme o sinal da variação.
+    if variacao_ontem is not None:
+        sinal       = "+" if variacao_ontem >= 0 else "-"
+        cor_var     = c['UP_COLOR'] if variacao_ontem >= 0 else c['DOWN_COLOR']
+        variacao_str = f"{sinal} {abs(variacao_ontem):.1f}% vs ontem"
+        # Recria o style com a cor certa — não podemos mudar o style global
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER
+        style_var = ParagraphStyle('var_color', fontName='Helvetica-Bold', fontSize=13,
+                                   textColor=cor_var, alignment=TA_CENTER)
+    else:
+        variacao_str = "—"
+        style_var    = styles['daily_val']
+
+    kpis_diarios = [
+        ('PRODUTO DO DIA',          prod_val,        styles['daily_val']),
+        ('HORA DE PICO',            hora_val,         styles['daily_val']),
+        ('VARIAÇÃO VS ONTEM',       variacao_str,     style_var),
+    ]
+
+    header_cells = [Paragraph(lbl, styles['daily_lbl'])         for lbl, _, _s in kpis_diarios]
+    value_cells  = [Paragraph(val, style)                        for _, val, style in kpis_diarios]
+
+    col_w = UTIL_W / 3
+    t = Table([header_cells, value_cells], colWidths=[col_w] * 3)
+    t.setStyle(TableStyle([
+        ('BACKGROUND',    (0, 0), (-1, -1), c['DAILY_BG']),
+        ('BOX',           (0, 0), (-1, -1), 1,    c['DAILY_TXT']),
+        ('INNERGRID',     (0, 0), (-1, -1), 0.5,  c['DIVIDER']),
+        ('TOPPADDING',    (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    return t
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _performance_table(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: float):
@@ -182,9 +260,9 @@ def gerar_relatorio(
     metricas: dict,
     nome_negocio: str = "O meu negocio",
     output_dir: str = 'data/gold',
-    semana_label: str = None
+    semana_label: str = None,
+    is_diario: bool = False,           # NOVO: True → adiciona secção de métricas diárias
 ) -> str:
-    # Imports lazy: só aqui é que ReportLab entra em memória
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table
     from reportlab.platypus import TableStyle
     from reportlab.lib.pagesizes import A4
@@ -194,20 +272,26 @@ def gerar_relatorio(
 
     PAGE_W, PAGE_H, MARGIN, UTIL_W = _dims()
     c = _cores()
-    styles = _styles()   # construído uma única vez para todo o documento
+    styles = _styles()
 
     is_mensal = (metricas.get('total') == metricas.get('total_mensal'))
 
     if semana_label and (semana_label.startswith("report_") or "_" in semana_label):
-        filename_final  = semana_label if semana_label.endswith(".pdf") else f"{semana_label}.pdf"
-        periodo_visual  = f"Período Comercial até {date.today().strftime('%d/%m/%Y')}"
+        filename_final = semana_label if semana_label.endswith(".pdf") else f"{semana_label}.pdf"
+        if is_diario:
+            periodo_visual = f"Relatório Diário - {date.today().strftime('%d/%m/%Y')}"
+        else:
+            periodo_visual = f"Período Comercial até {date.today().strftime('%d/%m/%Y')}"
     else:
         nome_ficheiro_limpo = nome_negocio.lower().replace(' ', '_')
         filename_final  = f"InsightZone_{nome_ficheiro_limpo}_estrategico.pdf"
-        periodo_visual  = semana_label if semana_label else (
-            f"Mes de {metricas.get('mes_nome', 'Junho')}" if is_mensal
-            else f"Semana Comercial até {date.today().strftime('%d/%m/%Y')}"
-        )
+        if is_diario:
+            periodo_visual = f"Relatório Diário - {date.today().strftime('%d/%m/%Y')}"
+        else:
+            periodo_visual = semana_label if semana_label else (
+                f"Mes de {metricas.get('mes_nome', 'Junho')}" if is_mensal
+                else f"Semana Comercial até {date.today().strftime('%d/%m/%Y')}"
+            )
 
     pdf_path = os.path.join(output_dir, filename_final)
     story = []
@@ -224,16 +308,37 @@ def gerar_relatorio(
     story.append(divider)
     story.append(Spacer(1, 4 * mm))
 
-    # Conteúdo
-    story.append(Paragraph("I. Indicadores Vitais de Desempenho", styles['section_title']))
+    # ── SECÇÃO DIÁRIA — só aparece quando is_diario=True ─────────────────────
+    # NOVO: verifica se há pelo menos uma métrica diária disponível antes de
+    # adicionar a secção — evita uma secção vazia no PDF se o ficheiro não
+    # tiver dados de hora nem dados de ontem.
+    tem_metricas_diarias = any([
+        metricas.get('produto_do_dia'),
+        metricas.get('hora_pico'),
+        metricas.get('variacao_ontem') is not None,
+    ])
+
+    if is_diario and tem_metricas_diarias:
+        story.append(Paragraph("I. Destaques do Dia", styles['section_title']))
+        story.append(_daily_highlights(metricas, styles, UTIL_W))
+        story.append(Spacer(1, 4 * mm))
+        num_kpi = "II"
+        num_top = "III"
+        num_dir = "IV"
+    else:
+        num_kpi = "I"
+        num_top = "II"
+        num_dir = "III"
+
+    story.append(Paragraph(f"{num_kpi}. Indicadores Vitais de Desempenho", styles['section_title']))
     story.append(_kpi_block(metricas, is_mensal, styles, UTIL_W))
     story.append(Spacer(1, 4 * mm))
 
-    story.append(Paragraph("II. Análise de Escoamento e Mix (Top 5)", styles['section_title']))
+    story.append(Paragraph(f"{num_top}. Análise de Escoamento e Mix (Top 5)", styles['section_title']))
     story.append(_performance_table(metricas, is_mensal, styles, UTIL_W))
     story.append(Spacer(1, 6 * mm))
 
-    story.append(Paragraph("III. Directrizes Operacionais Sugeridas", styles['section_title']))
+    story.append(Paragraph(f"{num_dir}. Directrizes Operacionais Sugeridas", styles['section_title']))
     story.append(_actionable_insights(metricas, is_mensal, styles, UTIL_W))
     story.append(Spacer(1, 8 * mm))
 
@@ -254,7 +359,6 @@ def gerar_relatorio(
     )
     doc.build(story)
 
-    # Liberta a lista story (pode incluir buffers de imagem internos do ReportLab)
     del story
     import gc
     gc.collect()

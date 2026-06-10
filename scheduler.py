@@ -1,6 +1,8 @@
 import gc
 import json
 import os
+import uuid
+from datetime import datetime
 
 import psycopg2
 import psycopg2.extras
@@ -12,6 +14,7 @@ from pipeline.metrics import calcular_metricas
 from pipeline.reader import ingest
 from pipeline.report import gerar_relatorio
 from pipeline.sender import main_function
+from pipeline.storage import download_ficheiro, upload_pdf  
 
 load_dotenv()
 
@@ -20,78 +23,150 @@ def get_conn():
     return psycopg2.connect(os.getenv("DATABASE_URL"))
 
 
-def enviar_relatorios_periodicos():
+def _processar_cliente(cliente: dict, frequencia_filtro: str):
     """
-    Corre de acordo com a cadência configurada.
-    Gera e envia relatório a cada cliente que tenha dados disponíveis.
+    Gera e envia o relatório para um cliente individual.
+    Separado em função própria para que um erro num cliente
+    não interrompa o loop dos restantes.
+
+    Parâmetros:
+      cliente          — dict com os dados do cliente (vem do SELECT)
+      frequencia_filtro — "semanal" | "mensal" | "diario"
+                          usado para filtrar período e gerar o PDF correcto
     """
-    conn = get_conn()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("SELECT * FROM clientes WHERE onboarding_passo = 0")
-    clientes = cursor.fetchall()
+    numero     = cliente["numero"]
+    nome       = cliente.get("nome") or "Cliente"
+    frequencia = cliente.get("frequencia", "semanal")
 
-    base_url = os.getenv("BASE_URL")
+    # Só processa clientes cuja frequência bate com o job que está a correr.
+    # Assim o job semanal não envia relatórios a clientes diários e vice-versa.
+    if frequencia != frequencia_filtro:
+        return
 
-    for cliente in clientes:
-        try:
-            numero          = cliente["numero"]
-            nome            = cliente.get("nome") or "Cliente"
-            ultimo_ficheiro = cliente.get("ultimo_ficheiro")
-            frequencia      = cliente.get("frequencia", "semanal")
+    #usa ultimo_ficheiro_url (Cloudinary) em vez de ultimo_ficheiro
+    # (path local que não existe no Render após restart).
+    ultimo_ficheiro_url = cliente.get("ultimo_ficheiro_url")
 
-            if not ultimo_ficheiro or not os.path.exists(ultimo_ficheiro):
-                main_function(
-                    numero, None, None,
-                    mensagem=f"Ola {nome}! Ainda nao recebi os teus dados. Envia o ficheiro para receberes o teu relatorio!"
-                )
-                continue
+    if not ultimo_ficheiro_url:
+        main_function(
+            numero, None, None,
+            mensagem=f"Ola {nome}! Ainda nao recebi os teus dados. Envia o ficheiro para receberes o teu relatorio!"
+        )
+        return
 
-            df       = ingest(ultimo_ficheiro)
-            metricas = calcular_metricas(df, frequencia_cliente=frequencia)
-            # df libertado dentro de calcular_metricas
+    # Descarrega o ficheiro do Cloudinary para um path temporário local
+    ext      = ultimo_ficheiro_url.split(".")[-1].lower()
+    if ext not in ("csv", "xlsx", "xls", "pdf"):
+        ext = "xlsx"
+    tmp_path = f"/tmp/scheduler_{numero}_{uuid.uuid4().hex[:6]}.{ext}"
 
-            pdf_path     = gerar_relatorio(metricas, nome_negocio=nome)
-            pdf_filename = os.path.basename(pdf_path)
-            pdf_url      = f"{base_url}/reports/{pdf_filename}"
+    df = None
+    try:
+        download_ficheiro(ultimo_ficheiro_url, tmp_path)
+        df = ingest(tmp_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-            main_function(numero, pdf_url, pdf_filename)
+    if df is None:
+        print(f"Erro: ingest falhou para {numero} — df e None")
+        return
 
-            # Guarda parquet para histórico — reutiliza ingest() uma única vez
-            # (antes havia um segundo ingest() desnecessário que duplicava I/O e RAM)
-            semana_parquet = f"data/silver/{nome.replace(' ', '_')}_latest.parquet"
-            os.makedirs("data/silver", exist_ok=True)
-            df_parquet = ingest(ultimo_ficheiro)
-            df_parquet.to_parquet(semana_parquet, index=False)
-            del df_parquet
-            gc.collect()
+    periodo   = "hoje" if frequencia == "diario" else None
+    metricas  = calcular_metricas(df, frequencia_cliente=frequencia, periodo=periodo)
+    del df
+    gc.collect()
 
-            # Actualiza histórico na base de dados
-            historico_actual = json.loads(cliente.get("historico") or "[]")
-            historico_actual.append(semana_parquet)
-            cursor.execute(
-                "UPDATE clientes SET historico = %s WHERE numero = %s",
-                (json.dumps(historico_actual), numero)
-            )
-            conn.commit()
+    timestamp_label    = datetime.now().strftime('%Y%m%d_%H%M%S')
+    hash_unico         = uuid.uuid4().hex[:6]
+    pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
 
-        except Exception as e:
-            print(f"Erro ao processar cliente {cliente.get('nome')}: {e}")
+    # passa is_diario=True para clientes diários activa a secção
+    # "Destaques do Dia" no PDF (produto do dia, hora de pico, variação vs ontem).
+    is_diario = (frequencia == "diario")
+    pdf_path  = gerar_relatorio(
+        metricas,
+        nome_negocio=nome,
+        semana_label=pdf_filename_limpo,
+        is_diario=is_diario,
+    )
 
+    #upload para Cloudinary em vez de construir URL local BASE_URL/reports/
+    pdf_url = upload_pdf(pdf_path)  
+
+    # Actualiza o último relatório na BD
+    conn   = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE clientes SET ultimo_relatorio_url = %s WHERE numero = %s",
+        (pdf_url, numero)
+    )
+    conn.commit()
     cursor.close()
     conn.close()
 
+    main_function(
+        numero, pdf_url, pdf_filename_limpo,
+        mensagem=f"O teu relatorio {frequencia} esta pronto:"
+    )
+
+
+def enviar_relatorios_periodicos(frequencia_filtro: str):
+    """
+    Corre de acordo com a cadência configurada.
+    Gera e envia relatório a cada cliente com a frequência correspondente.
+
+    Parâmetro frequencia_filtro: "semanal" | "mensal" | "diario"
+    """
+    conn   = get_conn()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    # Só busca clientes que completaram o onboarding
+    cursor.execute("SELECT * FROM clientes WHERE onboarding_passo = 0")
+    clientes = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    for cliente in clientes:
+        try:
+            _processar_cliente(cliente, frequencia_filtro)
+        except Exception as e:
+            print(f"Erro ao processar cliente {cliente.get('nome')}: {e}")
+
 
 def iniciar_scheduler():
-    """Inicia o scheduler chamado no lifespan do FastAPI."""
+    """Inicia o scheduler — chamado no lifespan do FastAPI."""
     scheduler = BackgroundScheduler()
 
-    # Relatórios semanais segunda-feira às 8h
+    # Relatórios semanais — segunda-feira às 8h
     scheduler.add_job(
         enviar_relatorios_periodicos,
         CronTrigger(day_of_week="mon", hour=8, minute=0),
         id="relatorios_semanais",
-        max_instances=1,          
-        misfire_grace_time=3600,  
+        kwargs={"frequencia_filtro": "semanal"},  
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    # Relatórios mensais — 1º dia do mês às 8h
+   
+    scheduler.add_job(
+        enviar_relatorios_periodicos,
+        CronTrigger(day=1, hour=8, minute=0),
+        id="relatorios_mensais",
+        kwargs={"frequencia_filtro": "mensal"},
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    # Relatórios diários — todos os dias às 20h
+    # NOVO: job diário para clientes com frequencia = 'diario'
+    scheduler.add_job(
+        enviar_relatorios_periodicos,
+        CronTrigger(hour=20, minute=0),
+        id="relatorios_diarios",
+        kwargs={"frequencia_filtro": "diario"},
+        max_instances=1,
+        misfire_grace_time=3600,
     )
 
     scheduler.start()
