@@ -1,6 +1,6 @@
 # InsightZone WhatsApp
 
-Serviço de business intelligence entregue directamente pelo WhatsApp Business. O cliente envia um ficheiro de vendas e recebe automaticamente um relatório PDF profissional com os insights da semana — sem instalar nada, sem fazer login em nenhum portal, sem aprender nenhuma ferramenta nova.
+Serviço de business intelligence entregue directamente pelo WhatsApp Business. O cliente envia um ficheiro de vendas e recebe automaticamente um relatório PDF profissional com os insights da semana sem instalar nada, sem fazer login em nenhum portal, sem aprender nenhuma ferramenta nova.
 
 ---
 
@@ -25,7 +25,7 @@ Serviço de business intelligence entregue directamente pelo WhatsApp Business. 
 
 ## Visão Geral
 
-O InsightZone recebe ficheiros de vendas (CSV, Excel ou PDF com texto seleccionável) enviados pelo WhatsApp, processa os dados através de um pipeline automatizado e devolve um relatório PDF profissional ao remetente — tudo em menos de 60 segundos.
+O InsightZone recebe ficheiros de vendas (CSV, Excel ou PDF com texto seleccionável) enviados pelo WhatsApp, processa os dados através de um pipeline automatizado e devolve um relatório PDF profissional ao remetente tudo em menos de 60 segundos.
 
 O produto foi desenhado para o mercado africano, onde o WhatsApp é o canal de comunicação dominante para pequenas e médias empresas. A proposta de valor assenta na ausência total de fricção de adopção: o cliente já usa o WhatsApp e não precisa de aprender nenhuma ferramenta nova.
 
@@ -162,7 +162,7 @@ insightzone/
 |   |__ uploads/            ficheiros temporários — apagados automaticamente após processamento
 ```
 
-> **Nota:** O sistema de ficheiros do Render é efémero — ficheiros guardados em disco desaparecem a cada deploy ou restart. Os PDFs são enviados para o Cloudinary imediatamente após geração e o ficheiro local é apagado. Apenas a pasta `data/uploads/` é usada, exclusivamente para ficheiros temporários durante o processamento.
+> **Nota:** O sistema de ficheiros do Render é efémero ficheiros guardados em disco desaparecem a cada deploy ou restart. Os PDFs são enviados para o Cloudinary imediatamente após geração e o ficheiro local é apagado. Apenas a pasta `data/uploads/` é usada, exclusivamente para ficheiros temporários durante o processamento.
 
 ---
 
@@ -178,7 +178,7 @@ O pipeline segue a arquitectura medalhão (bronze, silver, gold):
 
 ### Schema do ficheiro do cliente
 
-O bot identifica automaticamente as colunas do ficheiro enviado pelo cliente usando heurística — não é necessário seguir um formato exacto. O schema abaixo é o formato recomendado para melhores resultados:
+O bot identifica automaticamente as colunas do ficheiro enviado pelo cliente usando heurística não é necessário seguir um formato exacto. O schema abaixo é o formato recomendado para melhores resultados:
 
 **Negócios de retalho / agropecuária:**
 
@@ -258,7 +258,7 @@ O endpoint `/webhook` está protegido com `slowapi` — máximo de 20 pedidos po
 
 ### Verificação de Assinatura SHA-256
 
-Cada pedido da Meta vem assinado com o `META_APP_SECRET` no header `X-Hub-Signature-256`. O InsightZone verifica esta assinatura antes de processar qualquer mensagem — pedidos sem assinatura válida recebem `403 Assinatura inválida`.
+Cada pedido da Meta vem assinado com o `META_APP_SECRET` no header `X-Hub-Signature-256`. O InsightZone verifica esta assinatura antes de processar qualquer mensagem pedidos sem assinatura válida recebem `403 Assinatura inválida`.
 
 O `META_APP_SECRET` encontra-se em **App Settings → Basic → App Secret** no dashboard da Meta.
 
@@ -280,7 +280,7 @@ Após configurar o `DATABASE_URL` no `.env`, corre uma única vez:
 python criar_tabela.py
 ```
 
-O script é idempotente — se a tabela já existir, adiciona apenas as colunas em falta sem perder dados.
+O script é idempotente se a tabela já existir, adiciona apenas as colunas em falta sem perder dados.
 
 ### Schema da tabela `clientes`
 
@@ -362,7 +362,7 @@ O `META_PHONE_NUMBER_ID` está errado. Corre o comando de verificação de crede
 O `META_APP_SECRET` no `.env` não corresponde ao valor em App Settings → Basic no dashboard da Meta. Confirma que copiaste o valor correcto sem espaços.
 
 **`429 Too Many Requests`**
-O rate limiter bloqueou o IP. Normal em testes com muitos pedidos seguidos — aguarda 1 minuto.
+O rate limiter bloqueou o IP. Normal em testes com muitos pedidos seguidos aguarda 1 minuto.
 
 **`ValueError: Colunas em falta`**
 O ficheiro enviado não tem colunas reconhecíveis. Verifica o output do terminal para ver o mapeamento tentado e adiciona as palavras-chave ao `MAPA_HEURISTICA` em `reader.py`.
