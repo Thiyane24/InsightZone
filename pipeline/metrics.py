@@ -23,6 +23,7 @@ def _parse_datas_robusto(serie: pd.Series) -> pd.Series:
     Tenta multiplos formatos de data em sequencia, sem ambiguidade.
     Formatos suportados:
       YYYY-MM-DD  (ISO)
+      YYYY/MM/DD  (variante ISO com barras)
       DD/MM/YYYY  (PT)
       Month D, YYYY  (EN: "June 3, 2026")
       DD-MM-YYYY
@@ -31,7 +32,7 @@ def _parse_datas_robusto(serie: pd.Series) -> pd.Series:
     s = serie.astype(str).str.strip()
     resultado = pd.Series([pd.NaT] * len(s), dtype='datetime64[ns]', index=serie.index)
 
-    for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%B %d, %Y', '%d-%m-%Y'):
+    for fmt in ('%Y-%m-%d', '%Y/%m/%d', '%d/%m/%Y', '%B %d, %Y', '%d-%m-%Y'):
         mask = resultado.isna()
         if not mask.any():
             break
@@ -51,23 +52,17 @@ def _detectar_col_produto(colunas: list[str], tipo_negocio: str) -> str | None:
 
     Retorna o nome da coluna ou None se nao encontrar.
     """
-    # Vocabulario de retalho (produtos fisicos)
-    vocab_retalho = ('prod', 'item', 'mercador', 'artigo', 'sku')
-
-    # Vocabulario de servicos
+    vocab_retalho  = ('prod', 'item', 'mercador', 'artigo', 'sku')
     vocab_servicos = ('servic', 'descri', 'obra', 'tarefa', 'activid', 'activ',
                       'servico', 'prestac', 'trabalho', 'job', 'tipo_serv')
 
     tipo = (tipo_negocio or "retalho").lower()
 
     if tipo in ("servicos", "servico"):
-        # Para servicos: tenta primeiro vocabulario de servico, depois retalho
         ordens = (vocab_servicos, vocab_retalho)
     elif tipo in ("retalho", "agropecuaria"):
-        # Para retalho: tenta primeiro vocabulario de produto, depois servico
         ordens = (vocab_retalho, vocab_servicos)
     else:
-        # "outro" ou desconhecido: tenta os dois sem preferencia
         ordens = (vocab_retalho + vocab_servicos,)
 
     for vocab in ordens:
@@ -78,10 +73,84 @@ def _detectar_col_produto(colunas: list[str], tipo_negocio: str) -> str | None:
     return None
 
 
-def _validar_silver(df: pd.DataFrame, col_total: str, col_qtd: str | None) -> pd.DataFrame:
+def _remover_outliers_total(
+    df: pd.DataFrame,
+    col_total: str,
+    col_qtd: str | None,
+    col_preco: str | None,
+) -> pd.DataFrame:
+    """
+    Remove linhas cujo valor de Total é inconsistente ou anómalo.
+
+    Estratégia em duas camadas:
+
+    Camada 1 — Validação cruzada Qtd × Preço (quando ambas as colunas existem):
+        Rejeita linhas onde |Total - (Qtd × Preço)| > 10% do valor calculado.
+        Apanha placeholders como 99999 sem tocar em descontos ou arredondamentos
+        legítimos.
+
+    Camada 2 — IQR fence (sempre aplicada após a camada 1):
+        Calcula Q1 e Q3 da coluna Total. Define o limite superior como
+        Q3 + 3 × IQR (fence alargada para não rejeitar transacções grandes
+        legítimas). Remove apenas valores acima desse limite.
+        Com IQR × 3 em vez do clássico × 1.5, só outliers extremos são
+        removidos — adequado para dados de PMEs com alta variância natural.
+    """
+    if col_total not in df.columns or df.empty:
+        return df
+
+    n_antes = len(df)
+
+    # --- Camada 1: Qtd × Preço ---
+    if (
+        col_qtd and col_preco
+        and col_qtd in df.columns
+        and col_preco in df.columns
+    ):
+        qtd   = pd.to_numeric(df[col_qtd],   errors='coerce').fillna(0)
+        preco = pd.to_numeric(df[col_preco], errors='coerce').fillna(0)
+        total_calc = qtd * preco
+
+        # Só aplica a linhas onde temos Qtd e Preço válidos (> 0)
+        mascara_valida = (qtd > 0) & (preco > 0)
+        if mascara_valida.any():
+            desvio = (df[col_total] - total_calc).abs()
+            # Tolerância de 10% — absorve descontos e arredondamentos
+            tolerancia = total_calc.replace(0, 1) * 0.10
+            inconsistente = mascara_valida & (desvio > tolerancia)
+            n_rejeitados = inconsistente.sum()
+            if n_rejeitados > 0:
+                df = df[~inconsistente].reset_index(drop=True)
+
+    # --- Camada 2: IQR fence (Q3 + 3 × IQR) ---
+    if len(df) >= 4:  # IQR não é fiável com menos de 4 pontos
+        q1  = df[col_total].quantile(0.25)
+        q3  = df[col_total].quantile(0.75)
+        iqr = q3 - q1
+        if iqr > 0:
+            limite_superior = q3 + 3 * iqr
+            n_antes_iqr = len(df)
+            df = df[df[col_total] <= limite_superior].reset_index(drop=True)
+
+    return df
+
+
+def _validar_silver(
+    df: pd.DataFrame,
+    col_total: str,
+    col_qtd: str | None,
+    col_preco: str | None = None,
+) -> pd.DataFrame:
     """
     Rejeita linhas sujas ANTES de qualquer agregacao.
-    Chamado uma vez, logo apos a deteccao de colunas.
+
+    Passos:
+    1. Remove linhas completamente vazias.
+    2. Remove linhas cujo campo ID é igual ao nome da coluna (cabeçalhos duplicados).
+    3. Converte e valida col_total — NaN e valores <= 0 são rejeitados.
+    4. Converte e valida col_qtd — NaN e valores <= 0 são rejeitados.
+    5. Remove linhas sem produto/total quando ambas as colunas existem.
+    6. Remove outliers de Total via _remover_outliers_total.
     """
     df = df.dropna(how='all')
 
@@ -103,6 +172,9 @@ def _validar_silver(df: pd.DataFrame, col_total: str, col_qtd: str | None) -> pd
                      or 'servic' in c or 'descri' in c), None)
     if col_prod and col_total:
         df = df.dropna(subset=[col_prod, col_total])
+
+    # Remoção de outliers — camada 1 (Qtd×Preço) + camada 2 (IQR fence)
+    df = _remover_outliers_total(df, col_total, col_qtd, col_preco)
 
     return df.reset_index(drop=True)
 
@@ -150,7 +222,7 @@ def calcular_metricas(
     df: pd.DataFrame,
     frequencia_cliente: str = "semanal",
     periodo: str | None = None,
-    tipo_negocio: str = "retalho",     
+    tipo_negocio: str = "retalho",
 ) -> dict:
     """
     Calcula metricas de vendas/servicos a partir de um DataFrame.
@@ -176,8 +248,6 @@ def calcular_metricas(
     col_total   = next((c for c in df.columns if 'total' in c or 'revenue' in c
                         or 'faturac' in c or 'valor' in c), None)
     col_qtd     = next((c for c in df.columns if 'qtd' in c or 'quant' in c or 'qty' in c), None)
-
-    # ALTERADO: deteccao de produto/servico agora usa tipo_negocio
     col_produto = _detectar_col_produto(list(df.columns), tipo_negocio)
 
     # 3. PRECO UNITARIO
@@ -192,8 +262,8 @@ def calcular_metricas(
             df['total_calculado'] = df[col_preco].fillna(0) * qtd_serie.fillna(0)
             col_total = 'total_calculado'
 
-    # VALIDACAO SILVER
-    df = _validar_silver(df, col_total, col_qtd)
+    # VALIDACAO SILVER (inclui remoção de outliers)
+    df = _validar_silver(df, col_total, col_qtd, col_preco)
 
     if df.empty:
         return _resultado_vazio(tipo_negocio)
@@ -256,8 +326,6 @@ def calcular_metricas(
     )
 
     # 8. TOP PRODUTOS/SERVICOS
-    # A chave do dicionario usa "produto" internamente o report.py adapta o label
-    # conforme tipo_negocio para nao precisar de renomear as chaves do dict.
     if col_produto:
         top_produtos_dict = (
             df.groupby(col_produto)[col_qtd]
@@ -268,7 +336,6 @@ def calcular_metricas(
         )
         top_produtos_dict = {str(k): int(v) for k, v in top_produtos_dict.items()}
     else:
-        # Label do placeholder adapta-se ao tipo de negocio
         placeholder = "Nenhum servico detetado" if _e_servicos(tipo_negocio) else "Nenhum produto detetado"
         top_produtos_dict = {placeholder: 0}
 
@@ -276,7 +343,6 @@ def calcular_metricas(
     mes_nome     = datetime.now().strftime('%B')
     ticket_medio = total_faturado / total_transacoes if total_transacoes > 0 else 0.0
 
-    # METRICAS DIARIAS
     hora_pico      = None
     variacao_ontem = None
     produto_do_dia = None
@@ -308,7 +374,6 @@ def calcular_metricas(
         "melhor_dia":          melhor_dia_str,
         "top_produtos":        top_produtos_dict,
 
-        # Aliases mensais
         "total_mensal":        total_faturado,
         "transacoes_mensal":   total_transacoes,
         "ticket_medio_mensal": ticket_medio,
@@ -318,12 +383,10 @@ def calcular_metricas(
 
         "variacao_pct":        None,
 
-        # Metricas diarias
         "hora_pico":           hora_pico,
         "variacao_ontem":      variacao_ontem,
         "produto_do_dia":      produto_do_dia,
 
-        # NOVO: tipo_negocio propagado para o report.py
         "tipo_negocio":        (tipo_negocio or "retalho").lower(),
     }
 

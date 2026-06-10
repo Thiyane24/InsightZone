@@ -24,6 +24,10 @@ cursor.execute("""
         criado_em             TIMESTAMP DEFAULT NOW()
     )
 """)
+cursor.execute("""CREATE TABLE IF NOT EXISTS mensagens_vistas (
+    message_id TEXT PRIMARY KEY,
+    criado_em  TIMESTAMP DEFAULT NOW()
+);""")
 
 # adiciona colunas que possam faltar em BDs existentes.
 migracoes = [
