@@ -72,8 +72,13 @@ def _processar_cliente(cliente: dict, frequencia_filtro: str):
         print(f"Erro: ingest falhou para {numero} — df e None")
         return
 
+    tipo_negocio = cliente.get("negocio") or "retalho"   # CORRIGIDO: lido da BD
+
     periodo   = "hoje" if frequencia == "diario" else None
-    metricas  = calcular_metricas(df, frequencia_cliente=frequencia, periodo=periodo)
+    metricas  = calcular_metricas(
+        df, frequencia_cliente=frequencia,
+        periodo=periodo, tipo_negocio=tipo_negocio         # CORRIGIDO: passa tipo_negocio
+    )
     del df
     gc.collect()
 
@@ -81,14 +86,13 @@ def _processar_cliente(cliente: dict, frequencia_filtro: str):
     hash_unico         = uuid.uuid4().hex[:6]
     pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
 
-    # passa is_diario=True para clientes diários activa a secção
-    # "Destaques do Dia" no PDF (produto do dia, hora de pico, variação vs ontem).
     is_diario = (frequencia == "diario")
     pdf_path  = gerar_relatorio(
         metricas,
         nome_negocio=nome,
         semana_label=pdf_filename_limpo,
         is_diario=is_diario,
+        tipo_negocio=tipo_negocio,                         # CORRIGIDO: passa tipo_negocio
     )
 
     #upload para Cloudinary em vez de construir URL local BASE_URL/reports/
