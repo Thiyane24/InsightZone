@@ -58,7 +58,7 @@ Cliente recebe PDF no WhatsApp
 
 O FastAPI responde imediatamente com `200 OK` à Meta e processa o ficheiro em background via `BackgroundTasks`, evitando timeouts no webhook.
 
-O APScheduler corre dentro do FastAPI e envia relatórios automaticamente de forma semanal ou mensal para todos os clientes registados.
+O APScheduler corre dentro do FastAPI e envia relatórios automaticamente de forma diária, semanal ou mensal para todos os clientes registados.
 
 ---
 
@@ -66,7 +66,7 @@ O APScheduler corre dentro do FastAPI e envia relatórios automaticamente de for
 
 - Python 3.11 ou superior
 - Conta Meta for Developers com app WhatsApp Business configurada
-- Base de dados PostgreSQL (Render  free tier disponível)
+- Base de dados PostgreSQL (Render free tier disponível)
 - Conta Cloudinary para armazenamento de PDFs (free tier disponível)
 - ngrok (para desenvolvimento local) ou servidor com URL público (produção)
 
@@ -100,11 +100,10 @@ META_PHONE_NUMBER_ID=o_teu_phone_number_id
 META_WABA_ID=o_teu_waba_id
 META_APP_SECRET=o_teu_app_secret
 WEBHOOK_VERIFY_TOKEN=token_que_defines
-BASE_URL=https://o-teu-url-publico.com
 DATABASE_URL=postgresql://user:password@host:5432/insightzone_db
-CLOUDINARY_CLOUD_NAME=o_teu_cloud_name
-CLOUDINARY_API_KEY=a_tua_api_key
-CLOUDINARY_API_SECRET=o_teu_api_secret
+CLOUD_NAME=o_teu_cloud_name
+API_KEY=a_tua_api_key
+API_SECRET=o_teu_api_secret
 ```
 
 ### Obter as credenciais Meta
@@ -118,14 +117,14 @@ CLOUDINARY_API_SECRET=o_teu_api_secret
 
 > **Atenção:** O Phone Number ID e o WhatsApp Business Account ID são valores distintos. Confirma os valores correctos correndo este comando após configurar o `.env`:
 > ```bash
-> python -c "import httpx, os; from dotenv import load_dotenv; load_dotenv(); r = httpx.get('https://graph.facebook.com/v15.0/' + os.getenv('META_WABA_ID') + '/phone_numbers', headers={'Authorization': 'Bearer ' + os.getenv('META_ACCESS_TOKEN')}); print(r.json())"
+> python -c "import httpx, os; from dotenv import load_dotenv; load_dotenv(); r = httpx.get('https://graph.facebook.com/v25.0/' + os.getenv('META_WABA_ID') + '/phone_numbers', headers={'Authorization': 'Bearer ' + os.getenv('META_ACCESS_TOKEN')}); print(r.json())"
 > ```
 
 ### Obter as credenciais Cloudinary
 
 1. Cria conta gratuita em [cloudinary.com](https://cloudinary.com)
 2. No dashboard vai a **Settings → API Keys**
-3. Copia `Cloud Name`, `API Key` e `API Secret` para o `.env`
+3. Copia `Cloud Name`, `API Key` e `API Secret` para o `.env` como `CLOUD_NAME`, `API_KEY` e `API_SECRET`
 
 ### Configurar o webhook
 
@@ -142,8 +141,8 @@ CLOUDINARY_API_SECRET=o_teu_api_secret
 insightzone/
 |
 |__ app.py                  ponto de entrada FastAPI, webhook, comandos, onboarding
-|__ scheduler.py            APScheduler, envio automático semanal/mensal
-|__ criar_tabela.py         script único para criar a tabela na base de dados
+|__ scheduler.py            APScheduler, envio automático diário/semanal/mensal
+|__ criar_tabela.py         script único para criar/migrar a tabela na base de dados
 |__ requirements.txt        dependências Python com versões fixas
 |__ .env                    credenciais (nunca commitar)
 |__ .gitignore
@@ -155,6 +154,9 @@ insightzone/
 |   |__ report.py           geração do relatório PDF com ReportLab (imports lazy)
 |   |__ storage.py          upload de PDFs para o Cloudinary, devolve URL público permanente
 |   |__ sender.py           envio de mensagens e PDFs via Meta API, com retry automático
+|
+|__ tests/
+|   |__ test_insightzone.py suite de 21 testes (metrics, reader, sender)
 |
 |__ data/
 |   |__ uploads/            ficheiros temporários — apagados automaticamente após processamento
@@ -171,12 +173,14 @@ O pipeline segue a arquitectura medalhão (bronze, silver, gold):
 | Camada | Responsabilidade | Destino |
 |--------|-----------------|---------|
 | Bronze | Ficheiro bruto do cliente normalizado em DataFrame | memória |
-| Silver | DataFrame com métricas calculadas | memória |
+| Silver | DataFrame validado — linhas com valores inválidos rejeitadas | memória |
 | Gold | Relatório PDF gerado com ReportLab | Cloudinary |
 
 ### Schema do ficheiro do cliente
 
 O bot identifica automaticamente as colunas do ficheiro enviado pelo cliente usando heurística não é necessário seguir um formato exacto. O schema abaixo é o formato recomendado para melhores resultados:
+
+**Negócios de retalho / agropecuária:**
 
 | Coluna | Tipo | Exemplo |
 |--------|------|---------|
@@ -185,16 +189,26 @@ O bot identifica automaticamente as colunas do ficheiro enviado pelo cliente usa
 | quantidade | inteiro | 3 |
 | valor | decimal | 250.00 |
 
-Colunas com nomes alternativos como `Date`, `Item`, `Qty`, `Total`, `Price`, `Description` são detectadas e mapeadas automaticamente.
+**Negócios de serviços:**
+
+| Coluna | Tipo | Exemplo |
+|--------|------|---------|
+| data | texto ou data | 2026-05-17 |
+| servico | texto | Consultoria |
+| quantidade | inteiro | 1 |
+| valor | decimal | 5000.00 |
+
+Colunas com nomes alternativos como `Date`, `Item`, `Qty`, `Total`, `Price`, `Description`, `Service` são detectadas e mapeadas automaticamente.
 
 ### Métricas calculadas
 
-- Revenue total do período
+- Faturação total do período
 - Total de transacções
 - Ticket médio por transacção
 - Melhor dia do período
-- Top 5 produtos por quantidade
-- Variação percentual face ao período anterior (quando disponível)
+- Top 5 produtos ou serviços por quantidade
+- Hora de pico (relatórios diários, quando disponível)
+- Variação percentual face ao dia anterior (relatórios diários, quando disponível)
 
 ---
 
@@ -203,10 +217,26 @@ Colunas com nomes alternativos como `Date`, `Item`, `Qty`, `Total`, `Price`, `De
 | O cliente envia | O bot responde |
 |----------------|---------------|
 | olá / oi / hello / bom dia | Menu de opções |
-| ficheiro CSV ou Excel | Processamento automático e entrega do PDF |
+| ficheiro CSV, Excel ou PDF | Processamento automático e entrega do PDF |
+| relatorio / 2 | PDF do último relatório gerado |
 | resumo / 3 | Três KPIs principais em texto simples |
-| relatório / 2 | PDF do último relatório gerado |
-| top / 4 | Top 5 produtos do período |
+| top / 4 | Top 5 produtos ou serviços do período |
+| vendas / 5 | Introduzir vendas manualmente por texto |
+| frequencia / 6 | Alterar cadência dos relatórios automáticos |
+
+### Introdução de vendas por texto (comando 5)
+
+O cliente pode introduzir vendas sem ficheiro, no formato:
+
+```
+produto, quantidade, valor
+
+Frango, 3, 250
+Arroz, 5, 150
+Feijao, 2, 80
+```
+
+Para serviços, o formato é idêntico com a coluna `servico` em vez de `produto`.
 
 ### Onboarding
 
@@ -214,9 +244,9 @@ Quando um número novo envia a primeira mensagem, o bot inicia um fluxo de onboa
 
 1. Nome do negócio
 2. Tipo de negócio (Serviços, Retalho, Agropecuária, Outro)
-3. Cadência de relatórios (Semanal ou Mensal)
+3. Cadência de relatórios (Diária, Semanal ou Mensal)
 
-O estado do onboarding é persistido na base de dados PostgreSQL através do campo `onboarding_passo`.
+O estado do onboarding é persistido na base de dados PostgreSQL através do campo `onboarding_passo`. O valor `0` indica onboarding completo.
 
 ---
 
@@ -226,31 +256,23 @@ O estado do onboarding é persistido na base de dados PostgreSQL através do cam
 
 O endpoint `/webhook` está protegido com `slowapi` — máximo de 20 pedidos por minuto por IP. Pedidos acima desse limite recebem `429 Too Many Requests` automaticamente.
 
-```python
-@app.post("/webhook")
-@limiter.limit("20/minute")
-async def receber_webhook(request: Request, ...):
-```
-
 ### Verificação de Assinatura SHA-256
 
-Cada pedido da Meta vem assinado com o `APP_SECRET` no header `X-Hub-Signature-256`. O InsightZone verifica esta assinatura antes de processar qualquer mensagem — pedidos sem assinatura válida recebem `403 Assinatura inválida`.
-
-```python
-def verificar_assinatura_meta(payload_bytes: bytes, signature_header: str) -> bool:
-    expected = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature_header)
-```
+Cada pedido da Meta vem assinado com o `META_APP_SECRET` no header `X-Hub-Signature-256`. O InsightZone verifica esta assinatura antes de processar qualquer mensagem pedidos sem assinatura válida recebem `403 Assinatura inválida`.
 
 O `META_APP_SECRET` encontra-se em **App Settings → Basic → App Secret** no dashboard da Meta.
+
+### Deduplicação de mensagens
+
+Cada mensagem do WhatsApp tem um `message_id` único. O InsightZone mantém um conjunto em memória dos IDs já processados e ignora duplicados, evitando processamento duplo em caso de reenvio pela Meta.
 
 ---
 
 ## Base de Dados
 
-O InsightZone usa **PostgreSQL** para persistência de clientes em vez de ficheiros JSON locais.
+O InsightZone usa **PostgreSQL** para persistência de clientes.
 
-### Criar a tabela
+### Criar ou migrar a tabela
 
 Após configurar o `DATABASE_URL` no `.env`, corre uma única vez:
 
@@ -258,17 +280,22 @@ Após configurar o `DATABASE_URL` no `.env`, corre uma única vez:
 python criar_tabela.py
 ```
 
+O script é idempotente se a tabela já existir, adiciona apenas as colunas em falta sem perder dados.
+
 ### Schema da tabela `clientes`
 
 | Coluna | Tipo | Descrição |
 |--------|------|-----------|
 | numero | TEXT (PK) | Número WhatsApp do cliente |
 | nome | TEXT | Nome do negócio |
-| negocio | TEXT | Tipo de negócio |
-| frequencia | TEXT | `semanal` ou `mensal` |
-| ultimo_ficheiro | TEXT | Caminho do último ficheiro processado |
-| onboarding_passo | INTEGER | Passo actual do onboarding (0 = completo) |
-| historico | TEXT | JSON com histórico de parquets |
+| negocio | TEXT | Tipo de negócio (`retalho`, `servicos`, `agropecuaria`, `outro`) |
+| frequencia | TEXT | `diario`, `semanal` ou `mensal` |
+| ultimo_ficheiro | TEXT | Referência ao último ficheiro processado |
+| ultimo_ficheiro_url | TEXT | URL Cloudinary do último ficheiro de vendas |
+| ultimo_relatorio_url | TEXT | URL Cloudinary do último relatório PDF gerado |
+| onboarding_passo | INTEGER | Passo actual do onboarding (`0` = completo) |
+| historico | TEXT | JSON com histórico de interacções |
+| modo | TEXT | Estado temporário do bot (`aguardar_vendas`, `aguardar_frequencia`, ou `NULL`) |
 | criado_em | TIMESTAMP | Data de registo |
 
 ### Criar a base de dados no Render
@@ -289,9 +316,16 @@ uvicorn app:app --reload --port 8000
 ngrok http 8000
 ```
 
-O ngrok fornece um URL público que deves configurar como Callback URL no dashboard da Meta e como `BASE_URL` no `.env`.
+O ngrok fornece um URL público que deves configurar como Callback URL no dashboard da Meta.
 
 O token de acesso da Meta expira a cada 24 horas em modo de desenvolvimento. Para testes prolongados, cria um token permanente via System User no Meta Business Manager.
+
+### Correr os testes
+
+```bash
+pip install pytest
+pytest tests/test_insightzone.py -v
+```
 
 ---
 
@@ -312,7 +346,7 @@ Qualquer push para o branch `main` no GitHub dispara um deploy automático no Re
 
 ### Variáveis de ambiente em produção
 
-Todas as variáveis do `.env` devem ser configuradas no painel de variáveis de ambiente da plataforma de hosting. Nunca incluir o ficheiro `.env` no repositório.
+Todas as variáveis do `.env` devem ser configuradas no painel de variáveis de ambiente do Render. Nunca incluir o ficheiro `.env` no repositório.
 
 ---
 
@@ -330,12 +364,6 @@ O `META_APP_SECRET` no `.env` não corresponde ao valor em App Settings → Basi
 **`429 Too Many Requests`**
 O rate limiter bloqueou o IP. Normal em testes com muitos pedidos seguidos aguarda 1 minuto.
 
-**`ImportError: Unable to find a usable engine` (pyarrow)**
-```bash
-pip install setuptools
-pip install pyarrow
-```
-
 **`ValueError: Colunas em falta`**
 O ficheiro enviado não tem colunas reconhecíveis. Verifica o output do terminal para ver o mapeamento tentado e adiciona as palavras-chave ao `MAPA_HEURISTICA` em `reader.py`.
 
@@ -346,10 +374,10 @@ Confirma que o `WEBHOOK_VERIFY_TOKEN` no `.env` é exactamente igual ao valor pr
 Verifica se o campo `messages` está subscrito no dashboard da Meta em Configuration → Webhook fields.
 
 **PDF não chega ao cliente**
-Confirma que `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY` e `CLOUDINARY_API_SECRET` estão definidos nas variáveis de ambiente do Render. Verifica os logs do serviço para ver se o upload ao Cloudinary retornou erro.
+Confirma que `CLOUD_NAME`, `API_KEY` e `API_SECRET` estão definidos nas variáveis de ambiente do Render. Verifica os logs do serviço para ver se o upload ao Cloudinary retornou erro.
 
 **Render OOM (memory limit exceeded)**
-O servidor reiniciou por falta de memória. O pipeline já usa `gc.collect()` e imports lazy do ReportLab para minimizar o consumo. Se persistir, considera upgrade para o plano Starter ($7/mês, 2GB RAM).
+O servidor reiniciou por falta de memória. O pipeline já usa `gc.collect()` e imports lazy do ReportLab para minimizar o consumo. Se persistir, considera upgrade para o plano Starter ($7/mês, 2 GB RAM).
 
 ---
 
@@ -361,7 +389,7 @@ O servidor reiniciou por falta de memória. O pipeline já usa `gc.collect()` e 
 - A verificação de assinatura HMAC-SHA256 está implementada e activa em produção
 - Rate limiting activo no endpoint `/webhook` (20 pedidos/minuto por IP)
 - Ficheiros de upload temporários são apagados automaticamente após processamento
-- O envio de mensagens e PDFs tem retry automático (3 tentativas com backoff exponencial)
+- O envio de mensagens e PDFs tem retry automático (3 tentativas com backoff exponencial) e para imediatamente em erros fatais (401, 403, 404)
 
 ---
 
@@ -371,7 +399,7 @@ O servidor reiniciou por falta de memória. O pipeline já usa `gc.collect()` e 
 |-------|-------------|--------|
 | Básico | $10 / 640 MZN | 4 relatórios por mês, alertas básicos |
 | Pro | $25 / 1.600 MZN | Relatórios ilimitados, alertas avançados, suporte WhatsApp |
-| Empresa | $60 / 3.840 MZN | Multi-utilizador, relatórios personalizados, onboarding dedicado |
+| Empresa | $60 / 3.840 MZN | Relatórios personalizados, onboarding dedicado |
 
 ### Custos operacionais — 10 clientes MVP
 
@@ -380,7 +408,7 @@ O servidor reiniciou por falta de memória. O pipeline já usa `gc.collect()` e 
 | Meta Cloud API (menos de 1.000 conversas) | $0.00 |
 | Render.com (free tier) | $0.00 |
 | PostgreSQL (free tier) | $0.00 |
-| Cloudinary (free tier, 25GB) | $0.00 |
+| Cloudinary (free tier, 25 GB) | $0.00 |
 | Total | $0.00 |
 
 Com 10 clientes no plano Básico: $100/mês de receita com margem bruta de 100%.
