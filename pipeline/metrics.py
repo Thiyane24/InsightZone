@@ -4,14 +4,10 @@ from datetime import datetime, timedelta
 
 
 def _parse_numero_pt(serie: pd.Series) -> pd.Series:
-    """
-    Converte uma coluna de texto com formato PT (ponto de milhar, vírgula decimal)
-    para float. Valores que não sejam convertíveis tornam-se NaN.
-    Exemplo: "1.500,00" -> 1500.0 | "vinte" -> NaN | "N/A" -> NaN
-    """
     return (
         serie.astype(str)
              .str.strip()
+             .str.replace(r'\s(?=\d{3}(?!\d))', '', regex=True)  # ← linha nova
              .str.replace(r'\.(?=\d{3})', '', regex=True)
              .str.replace(',', '.', regex=False)
              .pipe(lambda s: pd.to_numeric(s, errors='coerce'))

@@ -31,7 +31,7 @@ load_dotenv()
 # uma query à BD nos casos mais comuns. Perde-se em restart — normal.
 _mensagens_vistas_cache: set = set()
 
-MENU = """Olá! Sou o InsightZone.
+MENU = """Olá {nome}.
 Modo actual: {frequencia}
 
 1. Enviar ficheiro de vendas em formato CSV, Excel ou PDF para receber o relatório.
@@ -719,7 +719,7 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         if not ultimo_relatorio_url:
             enviar_mensagem(numero_limpo, "Ainda não tens nenhum relatório. Envia um ficheiro CSV, Excel ou PDF para começar.")
             return
-        enviar_mensagem(numero_limpo, "A preparar o teu documento estratégico. Aguarda um momento...")
+        enviar_mensagem(numero_limpo, "A preparar o teu documento estratégico. Aguarda um momento")
         background_tasks.add_task(
             gerar_relatorio_background,
             numero_limpo, ultimo_relatorio_url, nome_cliente, frequencia_atual
