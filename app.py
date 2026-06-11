@@ -476,7 +476,11 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
         del ficheiro
         gc.collect()
 
-        df      = ingest(filepath)
+        print(f"DEBUG: ficheiro guardado em {filepath}")
+
+        df = ingest(filepath)
+        print(f"DEBUG ingest OK: colunas={list(df.columns)} | linhas={len(df)}")
+
         cliente = carregar_cliente(numero_limpo)
 
         frequencia   = cliente.get("frequencia",   "semanal")  if cliente else "semanal"
@@ -488,6 +492,7 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
             df, frequencia_cliente=frequencia,
             periodo=periodo, tipo_negocio=tipo_negocio
         )
+        print(f"DEBUG metricas OK: total={metricas.get('total')}")
 
         timestamp_label    = datetime.now().strftime('%Y%m%d_%H%M%S')
         hash_unico         = uuid.uuid4().hex[:6]
@@ -499,6 +504,7 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
             semana_label=pdf_filename_limpo, is_diario=is_diario,
             tipo_negocio=tipo_negocio
         )
+        print(f"DEBUG PDF gerado: {pdf_path}")
 
         pdf_url      = upload_pdf(pdf_path)
         ficheiro_url = upload_ficheiro_vendas(filepath)
@@ -512,7 +518,7 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
         print("Pipeline concluído com sucesso!")
 
     except ValueError as e:
-        # Erros conhecidos do pipeline (ficheiro inválido, PDF scanned, colunas em falta)
+        print(f"DEBUG ValueError: {e}")
         try:
             numero_limpo = limpar_numero(phone_number)
             enviar_mensagem(numero_limpo, str(e))
@@ -520,7 +526,9 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
             pass
 
     except Exception as e:
-        print(f"Erro ao processar ficheiro em background: {e}")
+        import traceback
+        print(f"DEBUG Exception: {e}")
+        print(traceback.format_exc())
         try:
             numero_limpo = limpar_numero(phone_number)
             enviar_mensagem(numero_limpo, "Ocorreu um erro ao processar o ficheiro. Verifica se o formato é válido (CSV, Excel ou PDF).")
