@@ -5,11 +5,6 @@ import os
 from pipeline.metrics import _parse_numero_pt, _parse_datas_robusto
 
 
-# Palavras-chave para detectar colunas de data, quantidade e valor.
-# Intencionalmente NÃO inclui produto/serviço — essas colunas são
-# detectadas pelo metrics._detectar_col_produto() que conhece o tipo_negocio
-# do cliente. Se renomearmos aqui perdemos o sinal "servic" -> "produto"
-# e todos os clientes de serviços seriam tratados como retalho.
 MAPA_HEURISTICA = {
     "data": [
         "data", "date", "fecha", "dt", "dia", "day", "periodo", "period",
@@ -27,17 +22,13 @@ MAPA_HEURISTICA = {
     ],
 }
 
-# Colunas que o reader.py normaliza activamente.
-# 'produto' foi removido intencionalmente — ver comentário acima.
-COLUNAS_NORMALIZADAS = {"data", "quantidade", "valor"}
+# 'quantidade' removida das colunas obrigatórias — ficheiros de serviços
+# tipicamente não têm essa coluna; o calcular_metricas já trata col_qtd=None
+# criando qtd_um=1 para todas as linhas.
+COLUNAS_NORMALIZADAS = {"data", "valor"}
 
 
 def _mapear_colunas_heuristica(colunas: list) -> dict:
-    """
-    Mapeia colunas do ficheiro para data, quantidade e valor usando palavras-chave.
-    Não toca em colunas de produto/serviço — essas são responsabilidade do metrics.py.
-    Devolve dict {coluna_original: nome_normalizado}.
-    """
     mapeamento  = {}
     ja_mapeados = set()
 
@@ -58,34 +49,21 @@ def _mapear_colunas_heuristica(colunas: list) -> dict:
 
 
 def _normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza o DataFrame garantindo que as colunas data, quantidade e valor
-    existem com esses nomes exactos. As colunas de produto/serviço são
-    preservadas com os seus nomes originais para que metrics.py as detecte.
-
-    Retorna DataFrame normalizado, ou DataFrame vazio se as colunas mínimas
-    não forem encontradas (em vez de levantar excepção — o ingest() trata).
-    """
-    # Remove colunas sem nome (artefactos de leitura de PDF/Excel)
     df = df.loc[:, df.columns.notna()]
     df = df.loc[:, df.columns.astype(str).str.strip() != ""]
-
-    # Remove colunas completamente vazias
     df = df.dropna(axis=1, how="all")
 
-    # Guarda os nomes originais antes de qualquer transformação
     colunas_originais = list(df.columns)
 
-    # Lowercase para comparação — usa dict para evitar colisões silenciosas
     colunas_lower_map = {}
     for c in colunas_originais:
         chave = str(c).lower().strip()
         if chave not in colunas_lower_map:
             colunas_lower_map[chave] = c
 
-    # 1. Verifica se já tem data, quantidade, valor em lowercase
+    # 1. Rename directo para data, quantidade, valor (se existirem)
     rename_directo = {}
-    for nome_normalizado in COLUNAS_NORMALIZADAS:
+    for nome_normalizado in ("data", "quantidade", "valor"):
         if nome_normalizado in colunas_lower_map:
             col_original = colunas_lower_map[nome_normalizado]
             if col_original != nome_normalizado:
@@ -94,7 +72,7 @@ def _normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
     if rename_directo:
         df = df.rename(columns=rename_directo)
 
-    # 2. Para as que ainda faltam, tenta heurística
+    # 2. Heurística para colunas que ainda faltam
     faltam = COLUNAS_NORMALIZADAS - set(df.columns)
     if faltam:
         colunas_restantes = [c for c in df.columns if c not in COLUNAS_NORMALIZADAS]
@@ -103,7 +81,7 @@ def _normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
             print(f"Mapeamento heurístico de colunas: {mapeamento}")
             df = df.rename(columns=mapeamento)
 
-    # 3. Verificação final — se ainda faltam colunas mínimas, devolve vazio
+    # 3. Verificação final — só data e valor são obrigatórias
     faltam = COLUNAS_NORMALIZADAS - set(df.columns)
     if faltam:
         print(
@@ -112,11 +90,12 @@ def _normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
         )
         return pd.DataFrame()
 
-    # 4. Conversão de tipos — erros não levantam excepção (NaN preservado para _validar_silver)
+    # 4. Conversão de tipos
     try:
-        df["data"]       = _parse_datas_robusto(df["data"])
-        df["quantidade"] = _parse_numero_pt(df["quantidade"])
-        df["valor"]      = _parse_numero_pt(df["valor"])
+        df["data"]  = _parse_datas_robusto(df["data"])
+        df["valor"] = _parse_numero_pt(df["valor"])
+        if "quantidade" in df.columns:
+            df["quantidade"] = _parse_numero_pt(df["quantidade"])
     except Exception as e:
         print(f"Aviso na conversão de tipos: {e}")
 
@@ -124,12 +103,6 @@ def _normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def ingest(filepath: str) -> pd.DataFrame:
-    """
-    Lê um ficheiro CSV, Excel ou PDF e devolve um DataFrame normalizado.
-    As colunas data, quantidade e valor são sempre normalizadas.
-    A coluna de produto/serviço é preservada com o nome original
-    para que metrics._detectar_col_produto() a identifique correctamente.
-    """
     extension = os.path.splitext(filepath)[1].lstrip(".").lower()
 
     if extension == "csv":
@@ -149,7 +122,7 @@ def ingest(filepath: str) -> pd.DataFrame:
     if df.empty:
         raise ValueError(
             "Não foi possível identificar as colunas necessárias no ficheiro. "
-            "Verifica se o ficheiro tem colunas de data, quantidade e valor."
+            "Verifica se o ficheiro tem colunas de data e valor."
         )
 
     print(f"Ingest completo: {len(df)} linhas, colunas: {list(df.columns)}")
@@ -157,17 +130,9 @@ def ingest(filepath: str) -> pd.DataFrame:
 
 
 def _read_pdf(filepath: str) -> pd.DataFrame:
-    """
-    Extrai tabelas de um PDF com texto seleccionável.
-
-    PDFs digitalizados (scanned/imagem) não têm camada de texto — nenhuma
-    tabela é extraída e levantamos ValueError com mensagem clara para o
-    utilizador, em vez de devolver DataFrame vazio silenciosamente.
-    """
     frames = []
 
     with pdfplumber.open(filepath) as pdf:
-        n_paginas = len(pdf.pages)
         for page in pdf.pages:
             tables = page.extract_tables()
             if not tables:
@@ -183,7 +148,6 @@ def _read_pdf(filepath: str) -> pd.DataFrame:
     if frames:
         return pd.concat(frames, ignore_index=True)
 
-    # PDF sem tabelas — distingue scanned de PDF vazio para dar mensagem útil
     raise ValueError(
         "Não foi possível extrair dados do PDF enviado. "
         "O PDF parece ser uma imagem digitalizada (scan) e não tem texto seleccionável. "
