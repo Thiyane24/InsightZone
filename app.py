@@ -31,7 +31,7 @@ load_dotenv()
 # uma query à BD nos casos mais comuns. Perde-se em restart — normal.
 _mensagens_vistas_cache: set = set()
 
-MENU = """Olá {nome}.
+MENU = """Olá {nome}, sou o InsightZone.
 Modo actual: {frequencia}
 
 1. Enviar ficheiro de vendas em formato CSV, Excel ou PDF para receber o relatório.
@@ -710,7 +710,8 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
             numero_limpo,
             MENU.format(
                 frequencia=frequencia_atual.upper(),
-                top_label=_top_label(tipo_negocio)
+                top_label=_top_label(tipo_negocio),
+                nome=nome_cliente
             )
         )
         return
