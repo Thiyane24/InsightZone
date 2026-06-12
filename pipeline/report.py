@@ -374,6 +374,7 @@ def gerar_relatorio(
     semana_label: str = None,
     is_diario: bool = False,
     tipo_negocio: str = None,
+    frequencia: str = "semanal",
 ) -> str:
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     from reportlab.lib.pagesizes import A4
@@ -391,7 +392,7 @@ def gerar_relatorio(
     c      = _cores()
     styles = _styles()
 
-    is_mensal = (metricas.get('total') == metricas.get('total_mensal'))
+    is_mensal = (frequencia == "mensal")
 
     if semana_label and (semana_label.startswith("report_") or "_" in semana_label):
         filename_final = semana_label if semana_label.endswith(".pdf") else f"{semana_label}.pdf"

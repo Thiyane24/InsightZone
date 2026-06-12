@@ -7,7 +7,10 @@ def _parse_numero_pt(serie: pd.Series) -> pd.Series:
     return (
         serie.astype(str)
              .str.strip()
-             .str.replace(r'\s(?=\d{3}(?!\d))', '', regex=True)  # ← linha nova
+             .str.replace(r'(MZN|MT|USD|EUR|mzn|mt|usd|eur)\s*', '', regex=True)   # remove moeda no inicio
+             .str.replace(r'\s*(MZN|MT|USD|EUR|mzn|mt|usd|eur)', '', regex=True)   # remove moeda no final
+             .str.strip()
+             .str.replace(r'\s(?=\d{3}(?!\d))', '', regex=True)
              .str.replace(r'\.(?=\d{3})', '', regex=True)
              .str.replace(',', '.', regex=False)
              .pipe(lambda s: pd.to_numeric(s, errors='coerce'))
@@ -28,7 +31,8 @@ def _parse_datas_robusto(serie: pd.Series) -> pd.Series:
     s = serie.astype(str).str.strip()
     resultado = pd.Series([pd.NaT] * len(s), dtype='datetime64[ns]', index=serie.index)
 
-    for fmt in ('%Y-%m-%d', '%Y/%m/%d', '%d/%m/%Y', '%B %d, %Y', '%d-%m-%Y'):
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M',
+               '%Y-%m-%d', '%Y/%m/%d', '%d/%m/%Y', '%B %d, %Y', '%d-%m-%Y'):
         mask = resultado.isna()
         if not mask.any():
             break
@@ -136,6 +140,7 @@ def _validar_silver(
     col_total: str,
     col_qtd: str | None,
     col_preco: str | None = None,
+    tipo_negocio: str = "retalho",
 ) -> pd.DataFrame:
     """
     Rejeita linhas sujas ANTES de qualquer agregacao.
@@ -164,8 +169,7 @@ def _validar_silver(
         df = df[df[col_qtd].notna()]
         df = df[df[col_qtd] > 0]
 
-    col_prod = next((c for c in df.columns if 'prod' in c or 'item' in c
-                     or 'servic' in c or 'descri' in c), None)
+    col_prod = _detectar_col_produto(list(df.columns), tipo_negocio)
     if col_prod and col_total:
         df = df.dropna(subset=[col_prod, col_total])
 
@@ -183,6 +187,8 @@ def _hora_de_pico(df: pd.DataFrame, col_data: str) -> str | None:
     """
     try:
         horas = df[col_data].dt.hour
+        # nunique() <= 1: sem variação de horas → pode ser ficheiro sem campo de hora
+        # (datas parseadas como 00:00:00) — suprimir para evitar falsos positivos
         if horas.nunique() <= 1:
             return None
         hora_pico = int(horas.value_counts().idxmax())
@@ -259,7 +265,7 @@ def calcular_metricas(
             col_total = 'total_calculado'
 
     # VALIDACAO SILVER (inclui remoção de outliers)
-    df = _validar_silver(df, col_total, col_qtd, col_preco)
+    df = _validar_silver(df, col_total, col_qtd, col_preco, tipo_negocio)
 
     if df.empty:
         return _resultado_vazio(tipo_negocio)
@@ -272,6 +278,10 @@ def calcular_metricas(
         hoje = datetime.now().date()
 
         if periodo == "hoje":
+            # Guarda df com hoje+ontem ANTES do filtro para _variacao_ontem poder comparar
+            df_comparacao = df[
+                df[col_data].dt.date.isin([hoje, hoje - timedelta(days=1)])
+            ].copy()
             df = df[df[col_data].dt.date == hoje]
         elif periodo == "semana":
             inicio_semana = hoje - timedelta(days=hoje.weekday())
@@ -309,9 +319,10 @@ def calcular_metricas(
 
     if col_id:
         total_transacoes = int(df[col_id].nunique())
-    elif col_vendedor and col_data:
-        total_transacoes = int(df.groupby([df[col_data].dt.date, col_vendedor]).ngroups)
     else:
+        # Sem col_id: cada linha é uma transacção/venda distinta
+        # (o fallback anterior groupby+ngroups contava grupos dia+vendedor,
+        #  não linhas — 3 vendas do mesmo vendedor no mesmo dia contavam como 1)
         total_transacoes = int(len(df))
 
     vendas_por_dia = df.groupby(df[col_data].dt.date)[col_total].sum()
@@ -345,7 +356,10 @@ def calcular_metricas(
 
     if periodo == "hoje" or frequencia_cliente == "diario":
         hora_pico      = _hora_de_pico(df, col_data)
-        variacao_ontem = _variacao_ontem(df, col_data, col_total)
+        # Usa df_comparacao (hoje+ontem) para poder calcular a variação.
+        # df já foi filtrado para hoje → ontem não existe nele.
+        _df_var = locals().get('df_comparacao', df)
+        variacao_ontem = _variacao_ontem(_df_var, col_data, col_total)
 
         if col_produto and top_produtos_dict:
             primeiro = list(top_produtos_dict.keys())[0]

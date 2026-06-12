@@ -22,6 +22,7 @@ from pipeline.reader import ingest
 from pipeline.report import gerar_relatorio
 from pipeline.sender import enviar_mensagem, main_function
 from pipeline.storage import upload_pdf, upload_ficheiro_vendas, download_ficheiro
+from pipeline.scheduler import iniciar_scheduler
 
 load_dotenv()
 
@@ -404,7 +405,7 @@ def processar_vendas_texto_background(
         pdf_path  = gerar_relatorio(
             metricas, nome_negocio=nome_cliente,
             semana_label=pdf_filename_limpo, is_diario=is_diario,
-            tipo_negocio=tipo_negocio
+            tipo_negocio=tipo_negocio, frequencia=frequencia
         )
         pdf_url = upload_pdf(pdf_path)
 
@@ -485,7 +486,7 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
 
         frequencia   = cliente.get("frequencia",   "semanal")  if cliente else "semanal"
         tipo_negocio = cliente.get("negocio",      "retalho")  if cliente else "retalho"
-        nome_empresa = cliente.get("nome") or "O meu negócio"  if cliente else "O meu negócio"
+        nome_empresa = (cliente.get("nome") or "O meu negócio") if cliente else "O meu negócio"
 
         periodo  = "hoje" if frequencia == "diario" else None
         metricas = calcular_metricas(
@@ -502,7 +503,7 @@ def processar_ficheiro(phone_number: str, document_id: str, filename: str):
         pdf_path  = gerar_relatorio(
             metricas, nome_negocio=nome_empresa,
             semana_label=pdf_filename_limpo, is_diario=is_diario,
-            tipo_negocio=tipo_negocio
+            tipo_negocio=tipo_negocio, frequencia=frequencia
         )
         print(f"DEBUG PDF gerado: {pdf_path}")
 
@@ -773,7 +774,17 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
 
 limiter = Limiter(key_func=get_remote_address)
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Inicia o scheduler no arranque e para-o no shutdown."""
+    _scheduler = iniciar_scheduler()
+    yield
+    _scheduler.shutdown(wait=False)
+
+
+app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 

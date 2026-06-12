@@ -92,7 +92,8 @@ def _processar_cliente(cliente: dict, frequencia_filtro: str):
         nome_negocio=nome,
         semana_label=pdf_filename_limpo,
         is_diario=is_diario,
-        tipo_negocio=tipo_negocio,                         # CORRIGIDO: passa tipo_negocio
+        tipo_negocio=tipo_negocio,
+        frequencia=frequencia,
     )
 
     #upload para Cloudinary em vez de construir URL local BASE_URL/reports/
