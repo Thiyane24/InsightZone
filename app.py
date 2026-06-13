@@ -22,7 +22,7 @@ from pipeline.reader import ingest
 from pipeline.report import gerar_relatorio
 from pipeline.sender import enviar_mensagem, main_function
 from pipeline.storage import upload_pdf, upload_ficheiro_vendas, download_ficheiro
-from pipeline.scheduler import iniciar_scheduler
+from scheduler import iniciar_scheduler
 
 load_dotenv()
 
