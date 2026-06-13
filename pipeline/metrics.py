@@ -334,14 +334,29 @@ def calcular_metricas(
 
     # 8. TOP PRODUTOS/SERVICOS
     if col_produto:
-        top_produtos_dict = (
-            df.groupby(col_produto)[col_qtd]
-              .sum()
-              .sort_values(ascending=False)
-              .head(5)
-              .to_dict()
-        )
-        top_produtos_dict = {str(k): int(v) for k, v in top_produtos_dict.items()}
+        # Para serviços sem coluna de quantidade real (col_qtd sintético qtd_um=1):
+        # ordenar por faturação — 1 projecto de 50000 MZN é mais relevante do que
+        # 5 manutenções de 200 MZN. O valor no dict continua a ser ocorrências,
+        # que é o que o PDF mostra na coluna "Ocorrências".
+        # Para retalho ou serviços com qty real: ordenar por volume (qtd.sum()).
+        _qtd_e_sintetico = (col_qtd == 'qtd_um')
+        if _e_servicos(tipo_negocio) and _qtd_e_sintetico and col_total in df.columns:
+            _agg = (
+                df.groupby(col_produto)
+                  .agg(_fat=(col_total, 'sum'), _ocorr=(col_qtd, 'sum'))
+                  .sort_values('_fat', ascending=False)
+                  .head(5)
+            )
+            top_produtos_dict = {str(k): int(v) for k, v in _agg['_ocorr'].items()}
+        else:
+            top_produtos_dict = (
+                df.groupby(col_produto)[col_qtd]
+                  .sum()
+                  .sort_values(ascending=False)
+                  .head(5)
+                  .to_dict()
+            )
+            top_produtos_dict = {str(k): int(v) for k, v in top_produtos_dict.items()}
     else:
         placeholder = "Nenhum servico detetado" if _e_servicos(tipo_negocio) else "Nenhum produto detetado"
         top_produtos_dict = {placeholder: 0}
