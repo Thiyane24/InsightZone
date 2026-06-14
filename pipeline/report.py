@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, date
 
-# IMPORTS LAZY: ReportLab só é carregado quando gerar_relatorio() é chamado.
+# IMPORTS LAZY: ReportLab so e carregado quando gerar_relatorio() e chamado.
 
 
 # PALETA DE CORES
@@ -64,52 +64,57 @@ def _fmt_mzn(val: float) -> str:
     return f'MZN {val:,.2f}'
 
 
-# LABELS ADAPTATIVOS POR TIPO DE NEGÓCIO
+# LABELS ADAPTATIVOS POR TIPO DE NEGOCIO
 def _labels(tipo_negocio: str) -> dict:
     """
-    Devolve um dicionário de labels adaptados ao tipo de negócio.
-    Todos os textos visíveis no PDF passam por aqui — nunca hardcoded.
+    Devolve um dicionario de labels adaptados ao tipo de negocio.
+    Todos os textos visiveis no PDF passam por aqui — nunca hardcoded.
     """
     tipo = (tipo_negocio or "retalho").lower()
     e_servicos = tipo in ("servicos", "servico")
 
     if e_servicos:
         return {
-            "itens_vendidos":    "TRANSACÇÕES",
-            "ticket_medio":      "VALOR MÉDIO/SERVIÇO",
+            "itens_vendidos":    "TRANSACCOES",
+            "ticket_medio":      "VALOR MEDIO POR SERVICO",
             "melhor_dia":        "MELHOR DIA",
-            "top5_titulo":       "Análise de Serviços Prestados (Top 5)",
-            "top5_col_item":     "Serviço",
+            "top5_titulo":       "Analise de Servicos Prestados (Top 5)",
+            "top5_col_item":     "Servico",
             "top5_col_ranking":  "Ranking",
-            "top5_col_qty":      "Ocorrências",
-            "top5_col_rel":      "% Relevância",
-            "top5_sem_dados":    "Nenhum serviço detectado",
-            "destaque_item":     "SERVIÇO DO DIA",
-            "insight_item":      "serviço",
+            "top5_col_qty":      "Ocorrencias",
+            "top5_col_rel":      "% Relevancia",
+            "top5_sem_dados":    "Nenhum servico detectado",
+            "destaque_item":     "SERVICO DO DIA",
+            "insight_item":      "servico",
             "insight_acao":      (
-                "Recomenda-se aferir a capacidade operacional disponível para responder "
-                "à maior procura deste serviço. Considere criar um pacote combinado com "
-                "serviços complementares para aumentar o valor médio por cliente."
+                "Este servico lidera em volume de ocorrencias e representa a principal fonte "
+                "de receita do periodo. Verifica se tens capacidade operacional para manter "
+                "este ritmo sem comprometer a qualidade da entrega. Identifica os clientes que "
+                "mais o contratam e contacta-os para renovacao antecipada ou contrato trimestral "
+                "com valor fixo. Usa este dado para a proxima conversa comercial: tens historico "
+                "concreto para negociar com confianca."
             ),
         }
     else:
         return {
             "itens_vendidos":   "ITENS VENDIDOS",
-            "ticket_medio":     "TICKET MÉDIO",
+            "ticket_medio":     "TICKET MEDIO",
             "melhor_dia":       "MELHOR DIA",
-            "top5_titulo":      "Análise de Escoamento e Mix (Top 5)",
-            "top5_col_item":    "Produto Líder",
+            "top5_titulo":      "Analise de Escoamento e Mix (Top 5)",
+            "top5_col_item":    "Produto Lider",
             "top5_col_ranking": "Ranking",
             "top5_col_qty":     "Qtd Vendida",
-            "top5_col_rel":     "% Relevância Comercial",
+            "top5_col_rel":     "% Relevancia Comercial",
             "top5_sem_dados":   "Nenhum produto detectado",
             "destaque_item":    "PRODUTO DO DIA",
             "insight_item":     "produto",
             "insight_acao":     (
-                "Recomenda-se auditar o nível crítico de inventário com os vossos fornecedores "
-                "para blindar o canal contra ruturas. Estrategicamente, considere arquitetar um "
-                "pacote promocional associando este produto líder com os itens de menor tracção, "
-                "permitindo girar o stock de menor liquidez e expandir o Ticket Médio das transacções."
+                "Este produto lidera em volume de saida no periodo. Cruza este dado com a tua "
+                "margem actual: se a margem for baixa, o volume alto pode estar a mascarar um "
+                "problema de rentabilidade. Se a margem for saudavel, usa este historico de "
+                "procura para negociar melhor preco com o fornecedor. Considera tambem associar "
+                "este produto lider a itens de menor rotacao para aumentar o valor medio por "
+                "transaccao sem precisar de captar novos clientes."
             ),
         }
 
@@ -131,7 +136,7 @@ def _kpi_block(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: float):
         melhor_dia = metricas.get('melhor_dia', '-')
 
     kpis = [
-        ('FATURAÇÃO TOTAL',       _fmt_mzn(total)),
+        ('FATURACAO TOTAL',       _fmt_mzn(total)),
         (lbl['itens_vendidos'],   str(trans)),
         (lbl['ticket_medio'],     _fmt_mzn(ticket)),
         (lbl['melhor_dia'],       str(melhor_dia)),
@@ -155,14 +160,12 @@ def _kpi_block(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: float):
 
 def _bar_chart_top5(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: float):
     """
-    Gráfico de barras horizontais para o Top 5 produtos/serviços.
-    Desenhado com Flowables nativos do ReportLab — sem dependências externas.
-    Cada barra é proporcional à quantidade máxima do Top 5.
+    Grafico de barras horizontais redesenhado.
+    Fundo alternado por linha, ranking em destaque com cor accent,
+    primeiro lugar com cor PRIMARY mais escuro, percentagem do total
+    em cada barra como dado accionavel.
     """
-    from reportlab.platypus import Table, Paragraph, TableStyle, Spacer
-    from reportlab.lib.units import mm
-    from reportlab.graphics.shapes import Drawing, Rect, String
-    from reportlab.graphics import renderPDF
+    from reportlab.graphics.shapes import Drawing, Rect, String, Line
 
     c   = _cores()
     lbl = _labels(metricas.get('tipo_negocio', 'retalho'))
@@ -170,56 +173,90 @@ def _bar_chart_top5(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: float
     top_dict = metricas.get('top_produtos_mes', {}) if is_mensal else metricas.get('top_produtos', {})
 
     sem_dados = not top_dict or list(top_dict.keys())[0] in (
-        "Nenhum produto detectado", "Nenhum serviço detectado", "Sem dados válidos"
+        "Nenhum produto detectado", "Nenhum servico detectado", "Sem dados validos"
     )
     if sem_dados:
         return None
 
-    items  = list(top_dict.items())[:5]
-    max_qty = max(qty for _, qty in items) if items else 1
+    items   = list(top_dict.items())[:5]
+    total   = sum(qty for _, qty in items) or 1
+    max_qty = max(qty for _, qty in items) or 1
 
-    BAR_H      = 14
-    BAR_GAP    = 6
-    LABEL_W    = UTIL_W * 0.30
-    BAR_AREA_W = UTIL_W * 0.52
-    VAL_W      = UTIL_W * 0.18
-    TOTAL_H    = len(items) * (BAR_H + BAR_GAP) + 4
+    ROW_H      = 22
+    ROW_GAP    = 7
+    LABEL_W    = UTIL_W * 0.33
+    BAR_AREA_W = UTIL_W * 0.42
+    TOTAL_H    = len(items) * (ROW_H + ROW_GAP) + 12
 
     drawing = Drawing(UTIL_W, TOTAL_H)
 
+    # Linha de cabecalho do eixo
+    drawing.add(Line(
+        LABEL_W, TOTAL_H - 5,
+        LABEL_W + BAR_AREA_W, TOTAL_H - 5,
+        strokeColor=c['DIVIDER'], strokeWidth=0.5
+    ))
+
     for i, (nome, qty) in enumerate(items):
-        y = TOTAL_H - (i + 1) * (BAR_H + BAR_GAP) + BAR_GAP
+        y_base = TOTAL_H - (i + 1) * (ROW_H + ROW_GAP) + ROW_GAP
 
-        # Fundo cinzento da barra
+        # Fundo alternado por linha
+        bg_color = c['LIGHT_GREY'] if i % 2 == 0 else c['WHITE']
         drawing.add(Rect(
-            LABEL_W, y, BAR_AREA_W, BAR_H,
-            fillColor=c['BAR_BG'], strokeColor=None
+            0, y_base - 3, UTIL_W, ROW_H + 6,
+            fillColor=bg_color, strokeColor=None
         ))
 
-        # Barra colorida proporcional
-        bar_w = max((qty / max_qty) * BAR_AREA_W, 2)
-        drawing.add(Rect(
-            LABEL_W, y, bar_w, BAR_H,
-            fillColor=c['BAR_FILL'], strokeColor=None
-        ))
-
-        # Label do produto (truncado a 22 chars)
-        nome_curto = str(nome).strip().title()
-        if len(nome_curto) > 22:
-            nome_curto = nome_curto[:20] + "…"
+        # Numero do ranking em destaque
         drawing.add(String(
-            0, y + 3,
-            f"{i+1}. {nome_curto}",
-            fontName='Helvetica', fontSize=7.5,
+            5, y_base + 7,
+            f"{i + 1}",
+            fontName='Helvetica-Bold', fontSize=10,
+            fillColor=c['ACCENT']
+        ))
+
+        # Nome do servico ou produto
+        nome_curto = str(nome).strip().title()
+        if len(nome_curto) > 26:
+            nome_curto = nome_curto[:24] + "..."
+        drawing.add(String(
+            22, y_base + 7,
+            nome_curto,
+            fontName='Helvetica', fontSize=8,
             fillColor=c['BLACK']
         ))
 
-        # Valor à direita
+        # Fundo da barra
+        BAR_Y = y_base + 1
+        BAR_H = 9
+        drawing.add(Rect(
+            LABEL_W, BAR_Y, BAR_AREA_W, BAR_H,
+            fillColor=c['BAR_BG'], strokeColor=None
+        ))
+
+        # Barra proporcional — primeiro lugar com PRIMARY, restantes com ACCENT
+        fill  = c['PRIMARY'] if i == 0 else c['ACCENT']
+        bar_w = max((qty / max_qty) * BAR_AREA_W, 3)
+        drawing.add(Rect(
+            LABEL_W, BAR_Y, bar_w, BAR_H,
+            fillColor=fill, strokeColor=None
+        ))
+
+        # Ocorrencias a direita da barra
         drawing.add(String(
-            LABEL_W + BAR_AREA_W + 4, y + 3,
-            str(int(qty)),
+            LABEL_W + BAR_AREA_W + 7, y_base + 9,
+            f"{int(qty)} oc.",
             fontName='Helvetica-Bold', fontSize=7.5,
             fillColor=c['PRIMARY']
+        ))
+
+        # Percentagem do total abaixo das ocorrencias
+        pct = (qty / total) * 100
+        drawing.add(String(
+            LABEL_W + BAR_AREA_W + 7, y_base + 1,
+            f"{pct:.0f}% do total",
+            fontName='Helvetica', fontSize=6.5,
+            fillColor=c['MID_GREY']
         ))
 
     return drawing
@@ -227,7 +264,7 @@ def _bar_chart_top5(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: float
 
 def _daily_highlights(metricas: dict, styles: dict, UTIL_W: float):
     """
-    Bloco de destaque para relatórios diários.
+    Bloco de destaque para relatorios diarios.
     """
     from reportlab.platypus import Table, Paragraph, TableStyle
     from reportlab.lib.styles import ParagraphStyle
@@ -243,7 +280,7 @@ def _daily_highlights(metricas: dict, styles: dict, UTIL_W: float):
         nome_item  = str(produto_do_dia['nome']).strip().title()
         qty_item   = int(produto_do_dia['quantidade'])
         fat_item   = float(produto_do_dia['faturacao'])
-        item_val   = f"{nome_item}\n{qty_item} un · {_fmt_mzn(fat_item)}"
+        item_val   = f"{nome_item}\n{qty_item} un . {_fmt_mzn(fat_item)}"
     else:
         item_val = "-"
 
@@ -262,7 +299,7 @@ def _daily_highlights(metricas: dict, styles: dict, UTIL_W: float):
     kpis_diarios = [
         (lbl['destaque_item'],  item_val,       styles['daily_val']),
         ('HORA DE PICO',         hora_val,       styles['daily_val']),
-        ('VARIAÇÃO VS ONTEM',    variacao_str,   style_var),
+        ('VARIACAO VS ONTEM',    variacao_str,   style_var),
     ]
 
     header_cells = [Paragraph(l, styles['daily_lbl'])  for l, _, _s in kpis_diarios]
@@ -340,19 +377,19 @@ def _actionable_insights(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: 
     top_dict = metricas.get('top_produtos_mes', {}) if is_mensal else metricas.get('top_produtos', {})
 
     sem_dados = not top_dict or list(top_dict.keys())[0] in (
-        "Nenhum produto detectado", "Nenhum serviço detectado", "Sem dados válidos"
+        "Nenhum produto detectado", "Nenhum servico detectado", "Sem dados validos"
     )
 
     if sem_dados:
         insights_texto = (
-            "<b>Recomendação de Gestão:</b> Volume analítico insuficiente para este período. "
-            "Recomenda-se assegurar a exportação correcta dos registos nas próximas submissões."
+            "<b>Recomendacao de Gestao:</b> Volume analitico insuficiente para este periodo. "
+            "Assegura que os registos do periodo estao completos e exporta novamente o ficheiro."
         )
     else:
         top_1 = list(top_dict.keys())[0].strip().upper()
         insights_texto = (
-            f"<b>Recomendação de Gestão:</b> O {lbl['insight_item']} <b>{top_1}</b> detém o maior "
-            f"volume do período. {lbl['insight_acao']}"
+            f"<b>Recomendacao de Gestao:</b> O {lbl['insight_item']} <b>{top_1}</b> lidera "
+            f"o periodo em volume. {lbl['insight_acao']}"
         )
 
     t = Table([[Paragraph(insights_texto, styles['alert_p'])]], colWidths=[UTIL_W])
@@ -369,7 +406,7 @@ def _actionable_insights(metricas: dict, is_mensal: bool, styles: dict, UTIL_W: 
 
 def gerar_relatorio(
     metricas: dict,
-    nome_negocio: str = "O meu negócio",
+    nome_negocio: str = "O meu negocio",
     output_dir: str = 'data/gold',
     semana_label: str = None,
     is_diario: bool = False,
@@ -397,36 +434,36 @@ def gerar_relatorio(
     if semana_label and (semana_label.startswith("report_") or "_" in semana_label):
         filename_final = semana_label if semana_label.endswith(".pdf") else f"{semana_label}.pdf"
         if is_diario:
-            periodo_visual = f"Relatório Diário - {date.today().strftime('%d/%m/%Y')}"
+            periodo_visual = f"Relatorio Diario - {date.today().strftime('%d/%m/%Y')}"
         else:
-            periodo_visual = f"Período Comercial até {date.today().strftime('%d/%m/%Y')}"
+            periodo_visual = f"Periodo Comercial ate {date.today().strftime('%d/%m/%Y')}"
     else:
         nome_ficheiro_limpo = nome_negocio.lower().replace(' ', '_')
         filename_final  = f"InsightZone_{nome_ficheiro_limpo}_estrategico.pdf"
         if is_diario:
-            periodo_visual = f"Relatório Diário - {date.today().strftime('%d/%m/%Y')}"
+            periodo_visual = f"Relatorio Diario - {date.today().strftime('%d/%m/%Y')}"
         else:
             periodo_visual = semana_label if semana_label else (
-                f"Mês de {metricas.get('mes_nome', 'Junho')}" if is_mensal
-                else f"Semana Comercial até {date.today().strftime('%d/%m/%Y')}"
+                f"Mes de {metricas.get('mes_nome', 'Junho')}" if is_mensal
+                else f"Semana Comercial ate {date.today().strftime('%d/%m/%Y')}"
             )
 
     pdf_path = os.path.join(output_dir, filename_final)
     story = []
 
-    # Cabeçalho
+    # Cabecalho
     story.append(Paragraph(nome_negocio.upper(), styles['biz_name']))
-    story.append(Paragraph(f"Relatório de Direcção e Análise Estratégica  |  {periodo_visual}", styles['meta_sub']))
+    story.append(Paragraph(f"Relatorio de Direccao e Analise Estrategica  |  {periodo_visual}", styles['meta_sub']))
     story.append(Paragraph(f"Emitido em: {datetime.now().strftime('%d/%m/%Y %H:%M')} por InsightZone Core Engine", styles['meta_sub']))
     story.append(Spacer(1, 8 * mm))
 
-    # Divisória
+    # Divisoria
     divider = Table([['']], colWidths=[UTIL_W], rowHeights=[1.5])
     divider.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, -1), c['PRIMARY'])]))
     story.append(divider)
     story.append(Spacer(1, 4 * mm))
 
-    # SECÇÃO DIÁRIA
+    # SECCAO DIARIA
     tem_metricas_diarias = any([
         metricas.get('produto_do_dia'),
         metricas.get('hora_pico'),
@@ -450,7 +487,7 @@ def gerar_relatorio(
     story.append(_kpi_block(metricas, is_mensal, styles, UTIL_W))
     story.append(Spacer(1, 4 * mm))
 
-    # Top 5 — tabela + gráfico de barras
+    # Top 5 — tabela + grafico de barras
     story.append(Paragraph(f"{num_top}. {lbl['top5_titulo']}", styles['section_title']))
     story.append(_performance_table(metricas, is_mensal, styles, UTIL_W))
     story.append(Spacer(1, 4 * mm))
@@ -465,13 +502,13 @@ def gerar_relatorio(
     story.append(_actionable_insights(metricas, is_mensal, styles, UTIL_W))
     story.append(Spacer(1, 8 * mm))
 
-    # Rodapé
+    # Rodape
     story.append(Spacer(1, 5 * mm))
     story.append(Table([['']], colWidths=[UTIL_W], rowHeights=[0.5],
                        style=[('BACKGROUND', (0, 0), (-1, -1), c['DIVIDER'])]))
     story.append(Spacer(1, 2 * mm))
     story.append(Paragraph(
-        "Este documento contém dados proprietários e estratégicos obtidos via integração de sistemas. Classificação: Confidencial.",
+        "Este documento contem dados proprietarios e estrategicos obtidos via integracao de sistemas. Classificacao: Confidencial.",
         styles['footer']
     ))
 
@@ -485,5 +522,5 @@ def gerar_relatorio(
     del story
     gc.collect()
 
-    print(f'Relatório gerado: {pdf_path}')
+    print(f'Relatorio gerado: {pdf_path}')
     return pdf_path
