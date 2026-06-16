@@ -89,7 +89,7 @@ insightzone/
 │   └── sender.py           # Despachante da Meta API com retentativas automáticas de exponential backoff
 │
 └── tests/
-    └── test_insightzone.py # Suite de testes automatizados validando qualidade de dados e segurança de perímetro
+    └── unit_test.py # Suite de testes automatizados validando qualidade de dados e segurança de perímetro
 ```
 
 ## Esquema da Base de Dados Relacional
