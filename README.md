@@ -89,7 +89,7 @@ insightzone/
 │   └── sender.py           # Meta API dispatcher with automated exponential backoff retries
 │
 └── tests/
-    └── test_insightzone.py # Automated test suite validating data quality and perimeter security
+    └── unit_test.py # Automated test suite validating data quality and perimeter security
 ```
 
 ## Relational Database Schema
