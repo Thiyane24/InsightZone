@@ -1,7 +1,4 @@
-# InsightZone: Asynchronous Data Ingestion Pipeline and Business Intelligence Delivery Service via WhatsApp
-
-> **Project Status: In Active Testing**
-> InsightZone is functional and processing real data end to end, but it is still undergoing testing and refinement. Some edge cases, error states, and performance characteristics are still being validated. It is not yet a finished or polished product, but it is fully operational as a portfolio and learning project.
+# InsightZone: Data Ingestion Pipeline and Business Intelligence Delivery Service via WhatsApp
 
 InsightZone is a production grade data engineering and backend portfolio architecture designed to automate the ingestion, transformation, and analysis of transactional data. The system extracts raw sales inputs submitted either as unstructured text or tabular files via WhatsApp, normalizes the data through a three tier pipeline, and delivers a professional analytical report in PDF format asynchronously within 60 seconds.
 
