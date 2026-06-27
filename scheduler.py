@@ -14,13 +14,39 @@ from pipeline.metrics import calcular_metricas
 from pipeline.reader import ingest
 from pipeline.report import gerar_relatorio
 from pipeline.sender import main_function
-from pipeline.storage import download_ficheiro, upload_pdf  
+from pipeline.storage import download_ficheiro, upload_pdf
 
 load_dotenv()
 
 
+# ── CONNECTION POOL ────────────────────────────────────────────────────────
+# Criado uma vez no arranque. O Render free tier suporta até ~10 ligações
+# simultâneas no PostgreSQL — minconn=1, maxconn=5 é seguro.
+_db_pool: psycopg2.pool.SimpleConnectionPool | None = None
+
+
+def _get_pool() -> psycopg2.pool.SimpleConnectionPool:
+    global _db_pool
+    if _db_pool is None or _db_pool.closed:
+        _db_pool = psycopg2.pool.SimpleConnectionPool(
+            minconn=1,
+            maxconn=5,
+            dsn=os.getenv("DATABASE_URL"),
+        )
+    return _db_pool
+
+
 def get_conn():
-    return psycopg2.connect(os.getenv("DATABASE_URL"))
+    """Obtém uma ligação do pool. Usar sempre dentro de try/finally com put_conn()."""
+    return _get_pool().getconn()
+
+
+def put_conn(conn):
+    """Devolve a ligação ao pool. Chamar sempre no finally."""
+    try:
+        _get_pool().putconn(conn)
+    except Exception:
+        pass
 
 
 def _processar_cliente(cliente: dict, frequencia_filtro: str):
@@ -43,7 +69,7 @@ def _processar_cliente(cliente: dict, frequencia_filtro: str):
     if frequencia != frequencia_filtro:
         return
 
-    #usa ultimo_ficheiro_url (Cloudinary) em vez de ultimo_ficheiro
+    # Usa ultimo_ficheiro_url (Cloudinary) em vez de ultimo_ficheiro
     # (path local que não existe no Render após restart).
     ultimo_ficheiro_url = cliente.get("ultimo_ficheiro_url")
 
@@ -69,7 +95,7 @@ def _processar_cliente(cliente: dict, frequencia_filtro: str):
             os.remove(tmp_path)
 
     if df is None:
-        print(f"Erro: ingest falhou para {numero} — df e None")
+        print(f"Erro: ingest falhou para {numero} — df é None")
         return
 
     tipo_negocio = cliente.get("negocio") or "retalho"   # CORRIGIDO: lido da BD
@@ -96,19 +122,21 @@ def _processar_cliente(cliente: dict, frequencia_filtro: str):
         frequencia=frequencia,
     )
 
-    #upload para Cloudinary em vez de construir URL local BASE_URL/reports/
-    pdf_url = upload_pdf(pdf_path)  
+    # Upload para Cloudinary em vez de construir URL local BASE_URL/reports/
+    pdf_url = upload_pdf(pdf_path)
 
     # Actualiza o último relatório na BD
     conn   = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE clientes SET ultimo_relatorio_url = %s WHERE numero = %s",
-        (pdf_url, numero)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE clientes SET ultimo_relatorio_url = %s WHERE numero = %s",
+            (pdf_url, numero)
+        )
+        conn.commit()
+        cursor.close()
+    finally:
+        put_conn(conn)
 
     main_function(
         numero, pdf_url, pdf_filename_limpo,
@@ -124,12 +152,13 @@ def enviar_relatorios_periodicos(frequencia_filtro: str):
     Parâmetro frequencia_filtro: "semanal" | "mensal" | "diario"
     """
     conn   = get_conn()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    # Só busca clientes que completaram o onboarding
-    cursor.execute("SELECT * FROM clientes WHERE onboarding_passo = 0")
-    clientes = cursor.fetchall()
-    cursor.close()
-    conn.close()
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Só busca clientes que completaram o onboarding
+        cursor.execute("SELECT * FROM clientes WHERE onboarding_passo = 0")
+        clientes = cursor.fetchall()
+    finally:
+        put_conn(conn)
 
     for cliente in clientes:
         try:
@@ -147,13 +176,12 @@ def iniciar_scheduler():
         enviar_relatorios_periodicos,
         CronTrigger(day_of_week="mon", hour=8, minute=0),
         id="relatorios_semanais",
-        kwargs={"frequencia_filtro": "semanal"},  
+        kwargs={"frequencia_filtro": "semanal"},
         max_instances=1,
         misfire_grace_time=3600,
     )
 
     # Relatórios mensais — 1º dia do mês às 8h
-   
     scheduler.add_job(
         enviar_relatorios_periodicos,
         CronTrigger(day=1, hour=8, minute=0),
