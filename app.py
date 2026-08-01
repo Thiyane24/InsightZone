@@ -78,15 +78,6 @@ INSTRUCOES_FREQUENCIA = """Com que frequência queres receber os teus relatório
 
 Envia 'cancelar' para manter a opção actual."""
 
-# Mensagem de boas-vindas ao modo de acumulação de vendas por texto
-INSTRUCOES_VENDAS_TEXTO = """Perfeito! Envia as tuas vendas no seguinte formato, uma por linha:
-
-Produto, Quantidade, Valor
-Frango Grelhado, 3, 250
-Consultoria IT, 1, 5000
-
-Quando terminares, envia *pronto*."""
-
 
 # ── CONNECTION POOL ────────────────────────────────────────────────────────────
 # Criado uma vez no arranque. O Render free tier suporta até ~10 ligações
@@ -216,7 +207,7 @@ def carregar_cliente(phone_number: str) -> dict | None:
         conn   = get_conn()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico, ultimo_ficheiro_url, modo, texto_buffer "
+            "SELECT numero, nome, negocio, frequencia, ultimo_relatorio_url, onboarding_passo, historico, ultimo_ficheiro_url, modo "
             "FROM clientes WHERE numero = %s",
             (numero_limpo,)
         )
@@ -234,7 +225,6 @@ def carregar_cliente(phone_number: str) -> dict | None:
             "historico":            json.loads(row[6]) if row[6] else [],
             "ultimo_ficheiro_url":  row[7],
             "modo":                 row[8],
-            "texto_buffer":         row[9],
         }
     except Exception as e:
         print(f"Erro ao carregar cliente: {e}")
@@ -310,39 +300,6 @@ def carregar_todos_clientes() -> list:
     except Exception as e:
         print(f"Erro ao carregar todos os clientes: {e}")
         return []
-    finally:
-        if conn:
-            put_conn(conn)
-
-
-# ── BUFFER DE TEXTO (acumulação multi-mensagem) ────────────────────────────────
-
-def _append_buffer(numero_limpo: str, linha: str):
-    """
-    Acrescenta uma linha ao texto_buffer do cliente na BD.
-    Usa concatenação com separador de nova linha. Thread-safe via pool.
-    """
-    conn = None
-    try:
-        conn   = get_conn()
-        cursor = conn.cursor()
-        # COALESCE garante que NULL + linha = linha (primeiro append)
-        cursor.execute(
-            """
-            UPDATE clientes
-            SET texto_buffer = CASE
-                WHEN texto_buffer IS NULL OR texto_buffer = ''
-                THEN %s
-                ELSE texto_buffer || E'\\n' || %s
-            END
-            WHERE numero = %s
-            """,
-            (linha, linha, numero_limpo)
-        )
-        conn.commit()
-        cursor.close()
-    except Exception as e:
-        print(f"Erro ao acrescentar ao buffer: {e}")
     finally:
         if conn:
             put_conn(conn)
@@ -466,95 +423,6 @@ def processar_vendas_texto_background(
     except Exception as e:
         print(f"Erro ao processar vendas por texto: {e}")
         actualizar_cliente(numero_limpo, {"modo": None})
-
-    finally:
-        if filepath_temp and os.path.exists(filepath_temp):
-            try:
-                os.remove(filepath_temp)
-            except Exception:
-                pass
-
-
-# ── PIPELINE DE TEXTO ACUMULADO (aguardando_vendas_texto) ─────────────────────
-
-def processar_buffer_vendas_background(
-    numero_limpo: str,
-    buffer: str,
-    nome_cliente: str,
-    frequencia: str,
-    tipo_negocio: str,
-):
-    """
-    Processa o texto acumulado no buffer da BD exactamente como um upload de
-    ficheiro: ingest → métricas → PDF → Cloudinary → WhatsApp.
-    Limpa o buffer e repõe modo=None em caso de sucesso.
-    Em caso de erro de parsing, repõe modo='aguardando_vendas_texto' e limpa
-    o buffer para que o utilizador possa recomeçar.
-    """
-    filepath_temp = None
-    try:
-        # Prepend do cabeçalho exigido pelo pipeline/reader.py
-        texto_completo = "Produto,Quantidade,Valor\n" + buffer.strip()
-
-        # Escreve para ficheiro temporário e passa pelo ingest existente
-        os.makedirs("data/uploads", exist_ok=True)
-        timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath_temp = f"data/uploads/buffer_{numero_limpo}_{timestamp}.csv"
-        with open(filepath_temp, "w", encoding="utf-8") as f:
-            f.write(texto_completo)
-
-        df = ingest(filepath_temp)
-
-        if df is None or df.empty:
-            raise ValueError("DataFrame vazio após ingest")
-
-        periodo  = "hoje" if frequencia == "diario" else None
-        metricas = calcular_metricas(
-            df, frequencia_cliente=frequencia,
-            periodo=periodo, tipo_negocio=tipo_negocio
-        )
-        del df
-        gc.collect()
-
-        timestamp_label    = datetime.now().strftime("%Y%m%d_%H%M%S")
-        hash_unico         = uuid.uuid4().hex[:6]
-        pdf_filename_limpo = f"report_{timestamp_label}_{hash_unico}.pdf"
-
-        is_diario = (frequencia == "diario")
-        pdf_path  = gerar_relatorio(
-            metricas, nome_negocio=nome_cliente,
-            semana_label=pdf_filename_limpo, is_diario=is_diario,
-            tipo_negocio=tipo_negocio, frequencia=frequencia
-        )
-        pdf_url      = upload_pdf(pdf_path)
-        ficheiro_url = upload_ficheiro_vendas(filepath_temp)
-
-        actualizar_cliente(numero_limpo, {
-            "ultimo_relatorio_url": pdf_url,
-            "ultimo_ficheiro_url":  ficheiro_url,
-            "modo":                 None,
-            "texto_buffer":         None,
-        })
-
-        main_function(
-            numero_limpo, pdf_url, pdf_filename_limpo,
-            mensagem=f"O teu relatório {frequencia} está pronto:"
-        )
-        print(f"Buffer de vendas processado com sucesso para {numero_limpo}")
-
-    except Exception as e:
-        print(f"Erro ao processar buffer de vendas: {e}")
-        # Repõe o modo e limpa o buffer — utilizador pode recomeçar
-        actualizar_cliente(numero_limpo, {
-            "modo":         "aguardando_vendas_texto",
-            "texto_buffer": None,
-        })
-        enviar_mensagem(
-            numero_limpo,
-            "Não consegui processar as vendas enviadas. Verifica o formato e tenta novamente:\n\n"
-            "Produto, Quantidade, Valor\n"
-            "Frango Grelhado, 3, 250"
-        )
 
     finally:
         if filepath_temp and os.path.exists(filepath_temp):
@@ -793,7 +661,6 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         print(f"Erro crítico: não foi possível criar/carregar cliente {numero_limpo}")
         return
 
-    # ── Onboarding ─────────────────────────────────────────────────────────────
     if cliente["onboarding_passo"] == 1 and not cliente.get("nome"):
         saudacoes = {"ola", "olá", "oi", "hello", "hi", "bom dia", "boa tarde", "boa noite", "novo"}
         if texto in saudacoes or len(texto.strip()) <= 2:
@@ -811,44 +678,9 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
     nome_cliente         = cliente.get("nome")              or "O meu negócio"
     ultimo_relatorio_url = cliente.get("ultimo_relatorio_url")
     ultimo_ficheiro_url  = cliente.get("ultimo_ficheiro_url")
-    modo_actual          = cliente.get("modo")
 
-    # ── Modo aguardando_vendas_texto: acumulação multi-mensagem ────────────────
-    # Verificado ANTES de qualquer outro modo para evitar colisões de keywords.
-    if modo_actual == "aguardando_vendas_texto":
-
-        # Trigger de processamento
-        if texto == "pronto":
-            buffer = cliente.get("texto_buffer") or ""
-            if not buffer.strip():
-                enviar_mensagem(
-                    numero_limpo,
-                    "Não tens nenhuma venda registada ainda. Envia as linhas de vendas primeiro."
-                )
-                # Mantém o modo — utilizador pode continuar a enviar linhas
-                return
-
-            background_tasks.add_task(
-                processar_buffer_vendas_background,
-                numero_limpo,
-                buffer,
-                nome_cliente,
-                frequencia_atual,
-                tipo_negocio,
-            )
-            enviar_mensagem(numero_limpo, "A processar as tuas vendas. Aguarda um momento...")
-            return
-
-        # Acumulação de linhas
-        _append_buffer(numero_limpo, texto_original)
-        enviar_mensagem(
-            numero_limpo,
-            "Linha registada. Continua a enviar ou escreve *pronto* para gerar o relatório."
-        )
-        return
-
-    # ── Modo aguardar_vendas (single-shot — mantido para compatibilidade) ──────
-    if modo_actual == "aguardar_vendas":
+    # Modo aguardar_vendas
+    if cliente.get("modo") == "aguardar_vendas":
         if texto == "cancelar":
             actualizar_cliente(numero_limpo, {"modo": None})
             enviar_mensagem(numero_limpo, "Operação cancelada.")
@@ -860,8 +692,8 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         )
         return
 
-    # ── Modo aguardar_frequencia ───────────────────────────────────────────────
-    if modo_actual == "aguardar_frequencia":
+    # Modo aguardar_frequencia
+    if cliente.get("modo") == "aguardar_frequencia":
         if texto == "cancelar":
             actualizar_cliente(numero_limpo, {"modo": None})
             enviar_mensagem(numero_limpo, f"Operação cancelada. Frequência mantida: {frequencia_atual}.")
@@ -881,8 +713,6 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
             f"Vais passar a receber os teus relatórios {nova_freq}."
         )
         return
-
-    # ── Comandos principais ────────────────────────────────────────────────────
 
     if texto in ["ola", "olá", "oi", "hello", "hi", "bom dia", "boa tarde", "boa noite"]:
         enviar_mensagem(
@@ -927,9 +757,9 @@ def tratar_comando(phone_number: str, texto: str, background_tasks: BackgroundTa
         return
 
     if texto in ["vendas", "5"]:
-        # Entra no modo de acumulação multi-mensagem
-        actualizar_cliente(numero_limpo, {"modo": "aguardando_vendas_texto", "texto_buffer": None})
-        enviar_mensagem(numero_limpo, INSTRUCOES_VENDAS_TEXTO)
+        actualizar_cliente(numero_limpo, {"modo": "aguardar_vendas"})
+        instrucoes = INSTRUCOES_VENDAS_SERVICOS if _e_servicos(tipo_negocio) else INSTRUCOES_VENDAS
+        enviar_mensagem(numero_limpo, instrucoes)
         return
 
     if texto in ["frequencia", "frequência", "6"]:
