@@ -24,16 +24,20 @@ cursor.execute("""
         criado_em             TIMESTAMP DEFAULT NOW()
     )
 """)
-cursor.execute("""CREATE TABLE IF NOT EXISTS mensagens_vistas (
-    message_id TEXT PRIMARY KEY,
-    criado_em  TIMESTAMP DEFAULT NOW()
-);""")
 
-# adiciona colunas que possam faltar em BDs existentes.
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS mensagens_vistas (
+        message_id TEXT PRIMARY KEY,
+        criado_em  TIMESTAMP DEFAULT NOW()
+    )
+""")
+
+# Adiciona colunas que possam faltar em BDs existentes.
 migracoes = [
-    "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS ultimo_ficheiro_url  TEXT",
-    "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS ultimo_relatorio_url TEXT",
-    "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS modo                  TEXT",
+    "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS ultimo_ficheiro_url   TEXT",
+    "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS ultimo_relatorio_url  TEXT",
+    "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS modo                   TEXT",
+    "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS texto_buffer           TEXT",
 ]
 for sql in migracoes:
     cursor.execute(sql)
